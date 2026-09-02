@@ -5,7 +5,7 @@
 
 export type Unsubscribe = () => void
 
-export class Emitter<Events extends Record<string, unknown>> {
+export class Emitter<Events> {
   #handlers = new Map<keyof Events, Set<(payload: never) => void>>()
 
   on<K extends keyof Events>(event: K, handler: (payload: Events[K]) => void): Unsubscribe {

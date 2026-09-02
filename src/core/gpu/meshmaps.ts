@@ -20,13 +20,13 @@ import {
   ClampToEdgeWrapping,
   DataTexture,
   FloatType,
-  HalfFloatType,
   LinearFilter,
   NoColorSpace,
   RGBAFormat,
   RenderTarget,
   Vector3,
 } from 'three/webgpu'
+import { CHANNEL_TARGET_OPTIONS } from './targets'
 import type { Texture } from 'three/webgpu'
 import { cross, float, normalize, texture, uniform, vec3 } from 'three/tsl'
 import type { MeshMapNodes } from '../procedural/material'
@@ -54,17 +54,9 @@ export class MeshMaps {
   constructor(resolution: number) {
     this.resolution = resolution
     this.geometry = new RenderTarget(resolution, resolution, {
-      count: GEOMETRY_MAP_NAMES.length,
-      type: HalfFloatType,
+      ...CHANNEL_TARGET_OPTIONS,
       format: RGBAFormat,
-      depthBuffer: false,
-      stencilBuffer: false,
-      minFilter: LinearFilter,
-      magFilter: LinearFilter,
-      wrapS: ClampToEdgeWrapping,
-      wrapT: ClampToEdgeWrapping,
-      generateMipmaps: false,
-      colorSpace: NoColorSpace,
+      count: GEOMETRY_MAP_NAMES.length,
     })
     GEOMETRY_MAP_NAMES.forEach((name, i) => {
       this.geometry.textures[i].name = name

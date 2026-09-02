@@ -20,7 +20,13 @@ import {
 import type { Texture } from 'three/webgpu'
 import { SLOT_COUNT, SLOT_NAMES } from '../channels'
 
-const COMMON = {
+/**
+ * Shared descriptor for every channel-carrying target. Exported because copies
+ * between render targets require *identical* formats in WebGPU - a scratch
+ * buffer that quietly defaults to RGBA8 fails validation against an RGBA16F
+ * destination.
+ */
+export const CHANNEL_TARGET_OPTIONS = {
   depthBuffer: false,
   stencilBuffer: false,
   minFilter: LinearFilter,
@@ -40,7 +46,7 @@ export class SlotTargets {
   constructor(resolution: number, label = 'slots') {
     this.resolution = resolution
     this.rt = new RenderTarget(resolution, resolution, {
-      ...COMMON,
+      ...CHANNEL_TARGET_OPTIONS,
       format: RGBAFormat,
       count: SLOT_COUNT,
     })
@@ -73,7 +79,7 @@ export class CoverageTarget {
 
   constructor(resolution: number, label = 'coverage') {
     this.resolution = resolution
-    this.rt = new RenderTarget(resolution, resolution, { ...COMMON, format: RedFormat })
+    this.rt = new RenderTarget(resolution, resolution, { ...CHANNEL_TARGET_OPTIONS, format: RedFormat })
     this.rt.texture.name = label
   }
 

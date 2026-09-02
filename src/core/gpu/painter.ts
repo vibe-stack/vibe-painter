@@ -29,6 +29,7 @@ import {
 } from 'three/webgpu'
 import type { BufferGeometry, Renderer } from 'three/webgpu'
 import {
+  Fn,
   If,
   Loop,
   cross,
@@ -303,40 +304,46 @@ export class Painter {
     material.blendSrc = OneFactor
     material.blendDst = OneFactor
 
-    const coverage = float(0).toVar('brushCoverage')
-    Loop({ start: 0, end: MAX_STAMPS, type: 'int' }, ({ i }) => {
-      If(float(i).lessThan(this.#stampCount), () => {
-        const stamp = this.#stampPos.element(i)
-        const aux = this.#stampNrm.element(i)
-        const centre = stamp.xyz
-        const radius = max(stamp.w, float(1e-5))
-        const delta = positionWorld.sub(centre)
-        const distance = length(delta)
+    // Wrapped in `Fn` because TSL only permits `toVar`/`assign` inside a
+    // shader function stack; at module scope there is nothing to assign into.
+    const coverageFn = Fn(() => {
+      const coverage = float(0).toVar('brushCoverage')
+      Loop({ start: 0, end: MAX_STAMPS, type: 'int' }, ({ i }) => {
+        If(float(i).lessThan(this.#stampCount), () => {
+          const stamp = this.#stampPos.element(i)
+          const aux = this.#stampNrm.element(i)
+          const centre = stamp.xyz
+          const radius = max(stamp.w, float(1e-5))
+          const delta = positionWorld.sub(centre)
+          const distance = length(delta)
 
-        // Radial falloff. Hardness moves the inner edge of the ramp outward.
-        const inner = radius.mul(this.#hardness.clamp(0, 0.99))
-        const radial = smoothstep(radius, inner, distance)
+          // Radial falloff. Hardness moves the inner edge of the ramp outward.
+          const inner = radius.mul(this.#hardness.clamp(0, 0.99))
+          const radial = smoothstep(radius, inner, distance)
 
-        // Local frame so shaped alphas orient with the surface, not the world.
-        // Rebuilt here from tangent + normal to match three's handedness rule.
-        const tangent = vec3(tangentWorld)
-        const bitangent = cross(vec3(normalWorld), tangent).mul(tangentGeometry.w)
-        const local = vec2(dot(delta, tangent), dot(delta, bitangent)).div(radius)
-        const shaped = this.#alphaShape(local, radial)
+          // Local frame so shaped alphas orient with the surface, not the world.
+          // Rebuilt here from tangent + normal to match three's handedness rule.
+          const tangent = vec3(tangentWorld)
+          const bitangent = cross(vec3(normalWorld), tangent).mul(tangentGeometry.w)
+          const local = vec2(dot(delta, tangent), dot(delta, bitangent)).div(radius)
+          const shaped = this.#alphaShape(local, radial)
 
-        // Reject surfaces facing away from the stroke: this is what stops a
-        // brush from bleeding through to the far side of a thin object.
-        const facing = smoothstep(
-          this.#facing.mul(2).sub(1),
-          this.#facing.mul(2).sub(1).add(0.25),
-          dot(normalWorld, aux.xyz),
-        )
+          // Reject surfaces facing away from the stroke: this is what stops a
+          // brush from bleeding through to the far side of a thin object.
+          const facing = smoothstep(
+            this.#facing.mul(2).sub(1),
+            this.#facing.mul(2).sub(1).add(0.25),
+            dot(normalWorld, aux.xyz),
+          )
 
-        const value = shaped.mul(facing).mul(this.#flow).mul(aux.w)
-        coverage.assign(max(coverage, value.clamp(0, 1)))
+          const value = shaped.mul(facing).mul(this.#flow).mul(aux.w)
+          coverage.assign(max(coverage, value.clamp(0, 1)))
+        })
       })
+      return coverage
     })
 
+    const coverage = coverageFn()
     material.fragmentNode = vec4(coverage, coverage, coverage, coverage)
     this.#stampMaterial = material
     return material

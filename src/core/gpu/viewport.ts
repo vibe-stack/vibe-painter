@@ -16,7 +16,6 @@
 import { MeshPhysicalNodeMaterial, MeshBasicNodeMaterial, Vector2 } from 'three/webgpu'
 import type { Texture } from 'three/webgpu'
 import {
-  cross,
   float,
   normalize,
   pmremTexture,
@@ -28,10 +27,9 @@ import {
   vec3,
   vec4,
 } from 'three/tsl'
-import type { Channel } from '../channels'
 import { CHANNEL_INFO } from '../channels'
 import type { MeshMaps } from './meshmaps'
-import type { F, V3 } from './nodes'
+import type { F, V2, V3 } from './nodes'
 import { unpackSlots } from './packing'
 import type { SlotTargets } from './targets'
 
@@ -94,8 +92,13 @@ export class ViewportMaterials {
 
     // --- Shaded ----------------------------------------------------------
     const heightTexture = slots.texture(CHANNEL_INFO.height.slot)
-    const heightNormal = normalFromHeightTexture(heightTexture, uvNode, this.#texel, this.#heightScale)
-    const combined = combineNormals(bundle.normal as V3, heightNormal, this.#normalScale)
+    const heightNormal = normalFromHeightTexture(
+      heightTexture,
+      uvNode,
+      this.#texel as unknown as { x: F; y: F },
+      this.#heightScale as unknown as F,
+    )
+    const combined = combineNormals(bundle.normal as V3, heightNormal, this.#normalScale as unknown as F)
 
     this.shaded.colorNode = bundle.baseColor as V3
     this.shaded.roughnessNode = (bundle.roughness as F).clamp(0.015, 1)
@@ -150,8 +153,8 @@ export class ViewportMaterials {
  * Sampling the texture rather than differentiating the analytic material keeps
  * this correct for painted height too.
  */
-function normalFromHeightTexture(tex: Texture, uvNode: ReturnType<typeof uv>, texel: V3 | ReturnType<typeof uniform>, scale: F): V3 {
-  const size = texel as unknown as { x: F; y: F }
+function normalFromHeightTexture(tex: Texture, uvNode: V2, texel: { x: F; y: F }, scale: F): V3 {
+  const size = texel
   const swizzle = CHANNEL_INFO.height.swizzle as 'r' | 'g' | 'b' | 'a'
   const at = (dx: number, dy: number): F => {
     const sample = texture(tex, uvNode.add(vec2(size.x.mul(dx), size.y.mul(dy))))
@@ -176,6 +179,3 @@ function curvatureRamp(curvature: F): V3 {
   const concave = curvature.sub(0.5).mul(-2).clamp(0, 1)
   return vec3(convex.add(float(0.15)), float(0.15), concave.add(float(0.15)))
 }
-
-export const __unusedViewportImports = { cross }
-export type { Channel }

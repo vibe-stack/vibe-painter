@@ -13,7 +13,7 @@
  */
 
 import { float, max, mix, step, texture, uniform, vec2, vec4 } from 'three/tsl'
-import { MeshBasicNodeMaterial, NoBlending, RenderTarget, Vector2 } from 'three/webgpu'
+import { MeshBasicNodeMaterial, NoBlending, RGBAFormat, RedFormat, RenderTarget, Vector2 } from 'three/webgpu'
 import type { Renderer, Texture } from 'three/webgpu'
 import { QuadMesh } from 'three/webgpu'
 import { mrt, uv } from 'three/tsl'
@@ -22,7 +22,7 @@ import { GEOMETRY_MAP_NAMES } from './meshmaps'
 import type { MeshMaps } from './meshmaps'
 import { SLOT_COUNT, SLOT_NAMES } from '../channels'
 import type { PaintBuffer } from '../gpu/targets'
-import { SlotTargets } from '../gpu/targets'
+import { CHANNEL_TARGET_OPTIONS, SlotTargets } from '../gpu/targets'
 
 const NEIGHBOURS: [number, number][] = [
   [-1, -1], [0, -1], [1, -1],
@@ -47,17 +47,20 @@ function dilateNode(
   const sampleCoverage = (at: V2): F =>
     coverageSwizzle === 'w' ? texture(coverage, at).w : texture(coverage, at).x
 
-  const accum = sources.map(() => vec4(0, 0, 0, 0).toVar())
-  const weight = float(0).toVar('dilateWeight')
+  // Built as a plain expression tree rather than with mutable `toVar`/
+  // `addAssign`: TSL only allows assignments inside an `Fn()` stack, and with
+  // eight fixed taps there is nothing to gain from a loop variable.
+  let weight: F = float(0)
+  const accum: V4[] = sources.map(() => vec4(0, 0, 0, 0))
 
   for (const [dx, dy] of NEIGHBOURS) {
     const sampleUv = uvNode.add(texelSize.mul(vec2(dx, dy)))
     // Weight by coverage so empty neighbours contribute nothing - no branching,
     // and diagonal neighbours fall out of the same expression.
     const w = sampleCoverage(sampleUv).clamp(0, 1)
-    weight.addAssign(w)
+    weight = weight.add(w)
     sources.forEach((tex, i) => {
-      accum[i].addAssign(texture(tex, sampleUv).mul(w))
+      accum[i] = accum[i].add(texture(tex, sampleUv).mul(w))
     })
   }
 
@@ -153,11 +156,12 @@ export class Dilator {
   #ensureGeometryScratch(res: number): RenderTarget {
     if (this.#geometryScratch && this.#geometryScratch.width === res) return this.#geometryScratch
     this.#geometryScratch?.dispose()
+    // Must match the geometry maps exactly: a texture-to-texture copy is only
+    // valid between identical formats.
     const rt = new RenderTarget(res, res, {
+      ...CHANNEL_TARGET_OPTIONS,
+      format: RGBAFormat,
       count: GEOMETRY_MAP_NAMES.length,
-      depthBuffer: false,
-      stencilBuffer: false,
-      generateMipmaps: false,
     })
     GEOMETRY_MAP_NAMES.forEach((n, i) => {
       rt.textures[i].name = n
@@ -176,7 +180,7 @@ export class Dilator {
   #ensureCoverageScratch(res: number): RenderTarget {
     if (this.#coverageScratch && this.#coverageScratch.width === res) return this.#coverageScratch
     this.#coverageScratch?.dispose()
-    this.#coverageScratch = new RenderTarget(res, res, { depthBuffer: false, stencilBuffer: false, generateMipmaps: false })
+    this.#coverageScratch = new RenderTarget(res, res, { ...CHANNEL_TARGET_OPTIONS, format: RedFormat })
     this.#coverageScratch.texture.name = 'dilateCoverage'
     return this.#coverageScratch
   }
