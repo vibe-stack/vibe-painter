@@ -1,12 +1,20 @@
 /**
  * React binding for the headless core.
  *
- * The UI holds exactly one reference into the engine - the `VibePainter`
- * facade - and re-renders off its events. No component reaches past the API,
- * which is what keeps the core usable without React at all.
+ * The core is an imperative object graph: it owns a GPU device and render
+ * targets, so its state cannot live in React. The bridge is deliberately as
+ * small as it can be - one version counter on the engine, read through
+ * `useSyncExternalStore`.
+ *
+ * That matters for correctness, not just tidiness. An earlier version of this
+ * file re-rendered only on `documentChanged`, so every setter that was not a
+ * document edit - brush size, view mode, lighting - mutated the engine without
+ * React ever hearing about it, and the corresponding controls sat frozen at
+ * their old values. With a single counter that every mutator bumps, a control
+ * cannot go stale unless someone adds a setter that forgets to call `#notify`.
  */
 
-import { createContext, useContext, useEffect, useState } from 'react'
+import { createContext, useCallback, useContext, useSyncExternalStore } from 'react'
 import type { ReactNode } from 'react'
 import type { VibePainter } from '../core/api'
 
@@ -23,22 +31,27 @@ export function useApi(): VibePainter {
 }
 
 /**
- * Bumps whenever the document changes. Panels read it to re-render; it is a
- * revision counter rather than a state mirror, because the engine already owns
- * the document and duplicating it into React state would just create two
- * sources of truth.
+ * Subscribes the calling component to every engine change. Returns the current
+ * version, which is only useful as a dependency - read the values you need
+ * straight off the api.
  */
-export function useDocRevision(): number {
+export function useEngineVersion(): number {
   const api = useApi()
-  const [revision, setRevision] = useState(0)
-  useEffect(() => api.on('documentChanged', () => setRevision((r) => r + 1)), [api])
-  return revision
+  const subscribe = useCallback(
+    (onChange: () => void) => api.engine.events.on('changed', onChange),
+    [api],
+  )
+  return useSyncExternalStore(subscribe, () => api.engine.version)
 }
 
 /** Re-renders when the composite finishes, for previews that read the output. */
 export function useCompositeRevision(): number {
   const api = useApi()
-  const [revision, setRevision] = useState(0)
-  useEffect(() => api.on('compositeUpdated', () => setRevision((r) => r + 1)), [api])
-  return revision
+  const subscribe = useCallback(
+    (onChange: () => void) => api.engine.events.on('compositeUpdated', onChange),
+    [api],
+  )
+  // The composite has no version of its own; the engine's is monotonic and
+  // changes at least as often, which is all the store contract requires.
+  return useSyncExternalStore(subscribe, () => api.engine.version)
 }

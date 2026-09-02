@@ -125,7 +125,8 @@ export const hexScales = registerMaterial({
     const heightAt = (uvNode: V2): F => {
       const cell = hexGrid(uvNode.mul(p.float('scale')).add(vec2(offset, offset)))
       const d = cell.xy.length()
-      const edge = smoothstep(float(0.5).sub(p.float('gap')), float(0.5).sub(p.float('gap')).sub(0.06), d)
+      const inner = float(0.5).sub(p.float('gap'))
+      const edge = smoothstep(inner.sub(0.06), inner, d).oneMinus()
       const dome = float(1).sub(d.mul(2).clamp(0, 1)).pow(0.6).mul(p.float('dome'))
       const recess = hash21(cell.zw).mul(p.float('recess'))
       return edge.mul(dome.add(0.4).sub(recess))

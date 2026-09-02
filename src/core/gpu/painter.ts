@@ -105,7 +105,7 @@ export const DEFAULT_BRUSH: BrushSettings = {
   alpha: 'round',
   alphaScale: 1,
   alphaContrast: 0.5,
-  facing: 0.15,
+  facing: 0.5,
   erase: false,
 }
 
@@ -189,6 +189,8 @@ export class Painter {
    */
   begin(
     renderer: Renderer,
+    geometry: BufferGeometry,
+    maps: MeshMaps,
     target: StrokeTarget,
     brush: BrushSettings,
     spec: BrushMaterialSpec,
@@ -214,6 +216,18 @@ export class Painter {
     this.#eraseMode.value = brush.erase ? 1 : 0
 
     this.#active = { target, brush, spec, params, lastPoint: null, carry: 0, pending: [], painted: false }
+
+    // Compile both pipelines now, with a no-op draw each.
+    //
+    // WebGPU pipeline creation is asynchronous, and three skips a draw whose
+    // pipeline is still compiling. Building these lazily mid-stroke meant the
+    // opening stamps of a stroke were silently dropped - which reads as "I have
+    // to scrub over it several times before anything appears". A stamp pass
+    // with zero stamps and a commit against an empty stroke buffer both leave
+    // the target exactly as it was, so this is free apart from the compile.
+    this.#stampCount.value = 0
+    this.#pass.render(renderer, geometry, this.#stampMaterialFor(), this.#stroke.rt, false)
+    this.#commit(renderer, maps)
   }
 
   /**
@@ -320,7 +334,9 @@ export class Painter {
 
           // Radial falloff. Hardness moves the inner edge of the ramp outward.
           const inner = radius.mul(this.#hardness.clamp(0, 0.99))
-          const radial = smoothstep(radius, inner, distance)
+          // Forward edges only: WGSL leaves smoothstep indeterminate when
+          // low >= high, which silently broke the entire brush falloff.
+          const radial = smoothstep(inner, radius, distance).oneMinus()
 
           // Local frame so shaped alphas orient with the surface, not the world.
           // Rebuilt here from tangent + normal to match three's handedness rule.
@@ -357,7 +373,7 @@ export class Painter {
     const kind = this.#alphaKind
 
     const round = radial
-    const square = smoothstep(float(1), this.#hardness.clamp(0, 0.99), max(local.x.abs(), local.y.abs()))
+    const square = smoothstep(this.#hardness.clamp(0, 0.99), float(1), max(local.x.abs(), local.y.abs())).oneMinus()
     const speckleField = voronoi2(local.mul(scale.mul(6)), float(1)).x
     const speckle = radial.mul(smoothstep(contrast.mul(0.6), contrast.mul(0.6).add(0.25), speckleField))
     const splatterField = fbm01(vec3(local.mul(scale.mul(4)), 0), 4, 2.1, 0.55)

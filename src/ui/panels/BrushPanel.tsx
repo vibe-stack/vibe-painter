@@ -8,7 +8,7 @@
  * Brush alphas are procedural too: no bitmap stamps anywhere in this app.
  */
 
-import { useApi, useDocRevision } from '../context'
+import { useApi, useEngineVersion } from '../context'
 import { BRUSH_ALPHAS } from '../../core/gpu/painter'
 import { getMaterialDef, listMaterialDefs } from '../../core/procedural/material'
 import { Button, EmptyHint, Panel, SectionHeading, Select, Slider, Toggle } from '../widgets/controls'
@@ -16,7 +16,7 @@ import { ParamEditor } from '../widgets/ParamEditor'
 
 export function BrushPanel() {
   const api = useApi()
-  useDocRevision()
+  useEngineVersion()
   const brush = api.getBrush()
   const material = api.engine.brushMaterial
   const def = getMaterialDef(material.defId)

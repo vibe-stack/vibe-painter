@@ -7,7 +7,7 @@
  */
 
 import { useState } from 'react'
-import { useApi, useDocRevision } from '../context'
+import { useApi, useEngineVersion } from '../context'
 import type { LayerSummary } from '../../core/api'
 import { Button, Panel, Select, Slider } from '../widgets/controls'
 import { BLEND_MODES } from '../../core/doc/types'
@@ -16,7 +16,7 @@ import { getMaterialDef } from '../../core/procedural/material'
 
 export function LayerPanel() {
   const api = useApi()
-  useDocRevision()
+  useEngineVersion()
   const layers = api.listLayers()
   const activeId = api.activeLayerId
   const [showChannels, setShowChannels] = useState(false)

@@ -3,7 +3,7 @@
  * projected onto the surface, and its mask stack.
  */
 
-import { useApi, useDocRevision } from '../context'
+import { useApi, useEngineVersion } from '../context'
 import { getMaterialDef } from '../../core/procedural/material'
 import { PROJECTIONS } from '../../core/doc/types'
 import { EmptyHint, Field, Panel, SectionHeading, Select, Slider } from '../widgets/controls'
@@ -12,7 +12,7 @@ import { MaskEditor } from './MaskEditor'
 
 export function PropertiesPanel() {
   const api = useApi()
-  useDocRevision()
+  useEngineVersion()
   const layerId = api.activeLayerId
   const layer = layerId ? api.getLayer(layerId) : null
 

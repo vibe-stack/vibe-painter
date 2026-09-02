@@ -7,7 +7,7 @@
  */
 
 import { useState } from 'react'
-import { useApi, useDocRevision } from '../context'
+import { useApi, useEngineVersion } from '../context'
 import { ENVIRONMENT_PRESETS } from '../../core/gpu/environment'
 import { Button, Panel, SectionHeading, Select, Slider } from '../widgets/controls'
 
@@ -15,10 +15,12 @@ const RESOLUTIONS = [256, 512, 1024, 2048]
 
 export function ScenePanel() {
   const api = useApi()
-  useDocRevision()
+  useEngineVersion()
   const [preset, setPreset] = useState('studio')
-  const [heightScale, setHeightScale] = useState(1)
-  const [normalScale, setNormalScale] = useState(1)
+  // Read straight off the engine rather than mirroring it into React state:
+  // two copies of the same value is exactly how controls drift out of sync.
+  const heightScale = api.engine.heightScale
+  const normalScale = api.engine.normalScale
   const env = api.engine.environmentSettings
   const status = api.status()
 
@@ -76,7 +78,7 @@ export function ScenePanel() {
         min={0}
         max={4}
         step={0.01}
-        onChange={(value) => { setHeightScale(value); api.engine.setHeightScale(value) }}
+        onChange={(value) => api.engine.setHeightScale(value)}
       />
       <Slider
         label="Normal Strength"
@@ -84,7 +86,7 @@ export function ScenePanel() {
         min={0}
         max={3}
         step={0.01}
-        onChange={(value) => { setNormalScale(value); api.engine.setNormalScale(value) }}
+        onChange={(value) => api.engine.setNormalScale(value)}
       />
     </Panel>
   )

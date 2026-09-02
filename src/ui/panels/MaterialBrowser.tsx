@@ -7,13 +7,13 @@
  */
 
 import { useMemo, useState } from 'react'
-import { useApi, useDocRevision } from '../context'
+import { useApi, useEngineVersion } from '../context'
 import { listCategories, listMaterialDefs } from '../../core/procedural/material'
 import { Button, EmptyHint, Panel } from '../widgets/controls'
 
 export function MaterialBrowser() {
   const api = useApi()
-  useDocRevision()
+  useEngineVersion()
   const [category, setCategory] = useState<string>('All')
   const [query, setQuery] = useState('')
 

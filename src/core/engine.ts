@@ -27,9 +27,11 @@ import { Painter } from './gpu/painter'
 import type { BrushSettings, StrokeSample, StrokeTarget } from './gpu/painter'
 import { DEFAULT_BRUSH } from './gpu/painter'
 import { PaintBuffer } from './gpu/targets'
+import { initialisePaintBuffer } from './gpu/clear'
 import { clearTarget } from './gpu/uvspace'
 import { ViewportMaterials } from './gpu/viewport'
 import type { ViewMode } from './gpu/viewport'
+import { BrushCursor } from './gpu/cursor'
 import { ProceduralEnvironment, ENVIRONMENT_PRESETS } from './gpu/environment'
 import { LightRig } from './gpu/lighting'
 import type { EnvironmentSettings } from './gpu/environment'
@@ -42,6 +44,12 @@ import type { MaterialInstance, ProjectionSettings } from './doc/types'
 import { DEFAULT_PROJECTION } from './doc/types'
 
 export interface EngineEvents {
+  /**
+   * Any observable state change at all - document, brush, view mode, lighting.
+   * This is what the React binding watches; `documentChanged` and the rest stay
+   * for consumers that care about one specific kind of change.
+   */
+  changed: { reason: string }
   documentChanged: { reason: string }
   compositeUpdated: void
   bakeProgress: BakeProgress
@@ -75,6 +83,7 @@ export class Engine {
   #rayBaker = new RayBaker()
   #environment = new ProceduralEnvironment()
   #lights = new LightRig()
+  #cursor = new BrushCursor()
   #viewport = new ViewportMaterials()
   #paintBuffers = new Map<string, PaintBuffer>()
   #raycaster = new Raycaster()
@@ -87,6 +96,9 @@ export class Engine {
   #viewMode: ViewMode = 'shaded'
   #environmentSettings: EnvironmentSettings = { ...ENVIRONMENT_PRESETS.studio }
   #resolution: number
+  #version = 0
+  #heightScale = 1
+  #normalScale = 1
   #needsViewportRebuild = true
   #baking = false
   #showBackground = true
@@ -114,7 +126,28 @@ export class Engine {
     this.mesh.frustumCulled = false
     this.root.add(this.mesh)
     this.root.add(this.#lights.group)
+    this.root.add(this.#cursor.object)
+    this.#cursor.setBrush(this.#brush.radius, this.#brush.hardness, this.#brush.erase)
     this.#lights.apply(this.#environmentSettings)
+  }
+
+  /**
+   * Monotonic counter bumped by every observable state change.
+   *
+   * The core is deliberately imperative - it owns GPU resources whose lifetime
+   * cannot follow a render cycle - so React needs one thing to watch. This is
+   * it: `useSyncExternalStore` reads this number and the `changed` event tells
+   * it when to look again. The rule for anything added later is simply that a
+   * setter which alters observable state must call `#notify`, or the UI will
+   * silently show stale values.
+   */
+  get version(): number {
+    return this.#version
+  }
+
+  #notify(reason: string): void {
+    this.#version++
+    this.events.emit('changed', { reason })
   }
 
   // -- lifecycle ----------------------------------------------------------
@@ -175,6 +208,11 @@ export class Engine {
     this.#compositor.invalidateGraph()
     this.#needsViewportRebuild = true
 
+    // The brush radius is in world units, so a default that suits one model
+    // is invisible or enormous on another. Scale it to the mesh on load.
+    this.#brush.radius = Math.max(0.005, this.bounds().radius * 0.1)
+    this.#cursor.setBrush(this.#brush.radius, this.#brush.hardness, this.#brush.erase)
+
     const index = geometry.getIndex()
     const triangles = (index ? index.count : geometry.getAttribute('position').count) / 3
     this.events.emit('meshChanged', { triangles })
@@ -190,7 +228,10 @@ export class Engine {
     this.#compositor.setResolution(resolution)
     this.#painter.setResolution(resolution)
     this.#meshMaps.setSize(resolution)
-    for (const buffer of this.#paintBuffers.values()) buffer.setSize(resolution)
+    for (const buffer of this.#paintBuffers.values()) {
+      buffer.setSize(resolution)
+      if (this.#renderer) initialisePaintBuffer(this.#renderer, buffer)
+    }
     const set = this.activeTextureSet
     if (set) set.resolution = resolution
     if (this.#renderer) this.#bakeGeometry()
@@ -217,6 +258,7 @@ export class Engine {
     this.#syncPaintBuffers(set)
     this.#compositor.sync(set)
     this.events.emit('documentChanged', { reason })
+    this.#notify(reason)
   }
 
   #syncPaintBuffers(set: TextureSetState): void {
@@ -288,6 +330,7 @@ export class Engine {
     this.#viewMode = mode
     this.#viewport.setMode(mode)
     this.#applyViewMode()
+    this.#notify('viewMode')
   }
 
   get viewMode(): ViewMode {
@@ -299,12 +342,24 @@ export class Engine {
     this.mesh.material = this.#viewMode === 'shaded' ? this.#viewport.shaded : this.#viewport.debug
   }
 
+  get heightScale(): number {
+    return this.#heightScale
+  }
+
   setHeightScale(value: number): void {
+    this.#heightScale = value
     this.#viewport.setHeightScale(value)
+    this.#notify('heightScale')
+  }
+
+  get normalScale(): number {
+    return this.#normalScale
   }
 
   setNormalScale(value: number): void {
+    this.#normalScale = value
     this.#viewport.setNormalScale(value)
+    this.#notify('normalScale')
   }
 
   // -- environment --------------------------------------------------------
@@ -317,6 +372,7 @@ export class Engine {
   setShowBackground(value: boolean): void {
     this.#showBackground = value
     this.#applyBackground()
+    this.#notify('showBackground')
   }
 
   /**
@@ -352,6 +408,7 @@ export class Engine {
       if (!this.#viewport.built) this.#needsViewportRebuild = true
       this.#applyBackground()
     }
+    this.#notify('environment')
   }
 
   // -- baking -------------------------------------------------------------
@@ -412,6 +469,17 @@ export class Engine {
 
   setBrush(patch: Partial<BrushSettings>): void {
     this.#brush = { ...this.#brush, ...patch }
+    this.#cursor.setBrush(this.#brush.radius, this.#brush.hardness, this.#brush.erase)
+    this.#notify('brush')
+  }
+
+  /**
+   * Moves the on-surface brush ring. Pass `null` when the pointer leaves the
+   * mesh, or when a tool other than the brush is active.
+   */
+  setBrushCursor(hit: { point: [number, number, number]; normal: [number, number, number] } | null): void {
+    if (hit) this.#cursor.setHit(hit.point, hit.normal)
+    else this.#cursor.hide()
   }
 
   get brushMaterial(): MaterialInstance {
@@ -422,12 +490,13 @@ export class Engine {
     if (defId !== this.#brushMaterial.defId) {
       this.#brushMaterial = instantiateMaterial(defId, params)
       this.#brushParams = new ParamBag(getMaterialDef(defId)?.params ?? [], this.#brushMaterial.params)
-      return
+    } else {
+      for (const [key, value] of Object.entries(params)) {
+        this.#brushMaterial.params[key] = value
+        this.#brushParams.set(key, value)
+      }
     }
-    for (const [key, value] of Object.entries(params)) {
-      this.#brushMaterial.params[key] = value
-      this.#brushParams.set(key, value)
-    }
+    this.#notify('brushMaterial')
   }
 
   get paintTarget(): PaintTargetKind {
@@ -436,6 +505,7 @@ export class Engine {
 
   setPaintTarget(kind: PaintTargetKind): void {
     this.#paintTarget = kind
+    this.#notify('paintTarget')
   }
 
   get isStroking(): boolean {
@@ -468,7 +538,7 @@ export class Engine {
     const target = this.#resolveStrokeTarget()
     if (!renderer || !geometry || !target) return false
 
-    this.#painter.begin(renderer, target, this.#brush, {
+    this.#painter.begin(renderer, geometry, this.#meshMaps, target, this.#brush, {
       defId: this.#brushMaterial.defId,
       params: this.#brushMaterial.params,
       projection: this.#brushProjection,
@@ -493,6 +563,7 @@ export class Engine {
     if (painted) {
       this.#compositeNow()
       this.events.emit('documentChanged', { reason: 'stroke' })
+      this.#notify('stroke')
     }
   }
 
@@ -511,6 +582,7 @@ export class Engine {
 
   setBrushProjection(patch: Partial<ProjectionSettings>): void {
     this.#brushProjection = { ...this.#brushProjection, ...patch }
+    this.#notify('brushProjection')
   }
 
   // -- picking ------------------------------------------------------------
@@ -578,6 +650,7 @@ export class Engine {
     this.#meshMaps.dispose()
     this.#environment.dispose()
     this.#lights.dispose()
+    this.#cursor.dispose()
     this.#viewport.dispose()
     for (const buffer of this.#paintBuffers.values()) buffer.dispose()
     this.#paintBuffers.clear()

@@ -8,7 +8,7 @@
  */
 
 import { useEffect, useState } from 'react'
-import { useApi, useDocRevision } from '../context'
+import { useApi, useEngineVersion } from '../context'
 import { DEFAULT_BAKE_SETTINGS } from '../../core/doc/types'
 import type { BakeSettings } from '../../core/doc/types'
 import { Button, Panel, SectionHeading, Slider } from '../widgets/controls'
@@ -16,7 +16,7 @@ import type { BakeProgress } from '../../core/bake/baker'
 
 export function BakePanel() {
   const api = useApi()
-  useDocRevision()
+  useEngineVersion()
   const [settings, setSettings] = useState<BakeSettings>({ ...DEFAULT_BAKE_SETTINGS })
   const [progress, setProgress] = useState<BakeProgress | null>(null)
   const [error, setError] = useState<string | null>(null)

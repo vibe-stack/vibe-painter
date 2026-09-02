@@ -8,7 +8,7 @@
  * instead of being painted for one particular model.
  */
 
-import { useApi, useDocRevision } from '../context'
+import { useApi, useEngineVersion } from '../context'
 import { listGeneratorDefs, getGeneratorDef } from '../../core/procedural/generators'
 import type { GeneratorType, Levels } from '../../core/doc/types'
 import { BLEND_MODES } from '../../core/doc/types'
@@ -17,7 +17,7 @@ import { ParamEditor } from '../widgets/ParamEditor'
 
 export function MaskEditor({ layerId }: { layerId: string }) {
   const api = useApi()
-  useDocRevision()
+  useEngineVersion()
   const layer = api.getLayer(layerId)
   if (!layer) return null
   const mask = layer.mask

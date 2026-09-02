@@ -140,7 +140,7 @@ register({
     const t = ctx.meshMaps.thickness
     const th = ctx.params.float('threshold')
     const s = max(ctx.params.float('softness'), float(1e-3))
-    const thin = smoothstep(th.add(s), th.sub(s), t)
+    const thin = smoothstep(th.sub(s), th.add(s), t).oneMinus()
     const thick = smoothstep(th.sub(s), th.add(s), t)
     return mix(thin, thick, ctx.params.float('invert')).mul(grunge(ctx))
   },

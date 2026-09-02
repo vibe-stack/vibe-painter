@@ -218,7 +218,7 @@ export function stripes(x: F, duty: FloatIn, softness: FloatIn = 0.02): F {
   const t = fract(x)
   const d = fl(duty)
   const s = fl(softness)
-  return smoothstep(float(0).sub(s), s, t).mul(smoothstep(d.add(s), d.sub(s), t))
+  return smoothstep(float(0).sub(s), s, t).mul(smoothstep(d.sub(s), d.add(s), t).oneMinus())
 }
 
 /**

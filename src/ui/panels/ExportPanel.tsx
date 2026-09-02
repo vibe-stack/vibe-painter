@@ -7,13 +7,13 @@
  */
 
 import { useRef, useState } from 'react'
-import { useApi, useDocRevision } from '../context'
+import { useApi, useEngineVersion } from '../context'
 import { EXPORT_PRESETS } from '../../core/gpu/exporter'
 import { Button, Panel, SectionHeading, Select } from '../widgets/controls'
 
 export function ExportPanel() {
   const api = useApi()
-  useDocRevision()
+  useEngineVersion()
   const [presetId, setPresetId] = useState(EXPORT_PRESETS[0].id)
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<string | null>(null)

@@ -7,11 +7,10 @@
  * `src/core`, replaceable without touching it.
  */
 
-import { useEffect, useMemo, useState } from 'react'
-import { VibePainter } from './core/api'
+import { useEffect, useState } from 'react'
 import { VIEW_MODES } from './core/gpu/viewport'
 import type { ViewMode } from './core/gpu/viewport'
-import { ApiProvider, useApi, useDocRevision } from './ui/context'
+import { ApiProvider, useApi, useEngineVersion } from './ui/context'
 import { Viewport } from './ui/Viewport'
 import type { Tool } from './ui/Viewport'
 import { LayerPanel } from './ui/panels/LayerPanel'
@@ -22,6 +21,7 @@ import { BakePanel } from './ui/panels/BakePanel'
 import { ExportPanel } from './ui/panels/ExportPanel'
 import { ScenePanel } from './ui/panels/ScenePanel'
 import { Button } from './ui/widgets/controls'
+import { getSession } from './ui/session'
 
 const RIGHT_TABS = ['Properties', 'Materials', 'Brush', 'Bake', 'Scene', 'Export'] as const
 type RightTab = (typeof RIGHT_TABS)[number]
@@ -45,25 +45,8 @@ const VIEW_MODE_LABELS: Record<ViewMode, string> = {
 }
 
 export default function App() {
-  // One engine for the lifetime of the page. Recreating it would drop every
-  // GPU resource, so it deliberately does not depend on any React state.
-  const api = useMemo(() => VibePainter.create({ name: 'Untitled', resolution: 1024, primitive: 'torus-knot' }), [])
-
-  useEffect(() => {
-    // The headless API is the product, so publish it. Anything the UI can do
-    // is callable from the console or by an automation driving this page -
-    // `vibePainter.describe()` lists the whole surface.
-    ;(globalThis as unknown as { vibePainter: VibePainter }).vibePainter = api
-    const onPageHide = () => api.dispose()
-    window.addEventListener('pagehide', onPageHide)
-    return () => {
-      window.removeEventListener('pagehide', onPageHide)
-      delete (globalThis as unknown as { vibePainter?: VibePainter }).vibePainter
-      // Do not dispose here. React Strict Mode runs this cleanup and remounts
-      // with the same useMemo instance, which would leave a dead GPU engine
-      // on every full page load — HMR looked fine because it created a new one.
-    }
-  }, [api])
+  // Module-scoped, so the engine survives any remount. See `ui/session.ts`.
+  const api = getSession()
 
   return (
     <ApiProvider api={api}>
@@ -74,11 +57,11 @@ export default function App() {
 
 function Workspace() {
   const api = useApi()
-  useDocRevision()
+  useEngineVersion()
   const [tool, setTool] = useState<Tool>('orbit')
   const [tab, setTab] = useState<RightTab>('Properties')
   const [notice, setNotice] = useState<string | null>(null)
-  const [viewMode, setViewModeState] = useState<ViewMode>('shaded')
+  const viewMode = api.getViewMode()
 
   useEffect(() => {
     if (!notice) return
@@ -94,15 +77,13 @@ function Workspace() {
       if (event.key === 'v') setTool('orbit')
       if (event.key === 'c') {
         // Cycle the channel-solo view, the way Painter's C key does.
-        const index = VIEW_MODES.indexOf(viewMode)
-        const next = VIEW_MODES[(index + 1) % VIEW_MODES.length]
-        setViewModeState(next)
-        api.setViewMode(next)
+        const index = VIEW_MODES.indexOf(api.getViewMode())
+        api.setViewMode(VIEW_MODES[(index + 1) % VIEW_MODES.length])
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [api, viewMode])
+  }, [api])
 
   const status = api.status()
 
@@ -123,11 +104,7 @@ function Workspace() {
           <select
             className="rounded border border-neutral-700 bg-neutral-900 px-1.5 py-1 text-[11px] text-neutral-200 focus:border-sky-600 focus:outline-none"
             value={viewMode}
-            onChange={(event) => {
-              const mode = event.target.value as ViewMode
-              setViewModeState(mode)
-              api.setViewMode(mode)
-            }}
+            onChange={(event) => api.setViewMode(event.target.value as ViewMode)}
           >
             {VIEW_MODES.map((mode) => (
               <option key={mode} value={mode}>{VIEW_MODE_LABELS[mode]}</option>

@@ -57,8 +57,13 @@ export function blendFloat(mode: BlendMode, base: F, src: F): F {
  * accumulates instead of averaging away.
  */
 export function blendNormalMap(base: V3, src: V3): V3 {
+  // A zero-length source (an unwritten normal slot) would make the result
+  // normalize(vec3(0)) = NaN - and NaN survives `mix(a, b, 0)`, so a single
+  // degenerate texel turns the whole shaded surface black. Fall back to the
+  // flat normal instead of trusting the input.
+  const safeSrc = mix(vec3(0, 0, 1), src, step(float(1e-8), src.dot(src)))
   const t = base.add(vec3(0, 0, 1))
-  const u = src.mul(vec3(-1, -1, 1))
+  const u = safeSrc.mul(vec3(-1, -1, 1))
   return normalize(t.mul(t.dot(u)).div(max(t.z, float(1e-4))).sub(u))
 }
 
