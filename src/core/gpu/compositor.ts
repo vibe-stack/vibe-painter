@@ -55,6 +55,8 @@ export class Compositor {
   #structureKey = ''
   #needsRebuild = true
   #needsComposite = true
+  /** Extra draws after a shader rebuild. WebGPU skips the first draw of a new pipeline. */
+  #rebuildDraws = 0
 
   constructor(resolution: number) {
     this.output = new SlotTargets(resolution, 'composite')
@@ -116,8 +118,11 @@ export class Compositor {
     if (this.#needsRebuild || !this.#material) {
       this.#rebuild(set, maps, buffers)
       this.#needsRebuild = false
+      // The new pipeline's first draw is skipped; autoClear would leave the
+      // target black and a single composite would never recover.
+      this.#rebuildDraws = 3
     }
-    if (!this.#needsComposite) return false
+    if (!this.#needsComposite && this.#rebuildDraws === 0) return false
 
     const previous = renderer.getRenderTarget()
     renderer.setRenderTarget(this.output.rt)
@@ -125,6 +130,10 @@ export class Compositor {
     this.#quad.render(renderer)
     renderer.setRenderTarget(previous)
     this.#needsComposite = false
+    if (this.#rebuildDraws > 0) {
+      this.#rebuildDraws--
+      if (this.#rebuildDraws > 0) this.#needsComposite = true
+    }
     return true
   }
 
@@ -190,7 +199,7 @@ export class Compositor {
       } else {
         const buffer = ctx.buffers.get(layer.paintBufferId)
         if (buffer?.slots) {
-          src = unpackSlots(buffer.slots.rt.textures, ctx.uv)
+          src = unpackSlots(buffer.slots.rt.textures, ctx.uv, true)
           // Painted pixels only exist where the brush actually landed.
           amount = amount.mul(coverageOf(buffer, ctx))
         }
@@ -226,7 +235,7 @@ export class Compositor {
       const buffer = ctx.buffers.get(mask.paintBufferId)
       if (buffer) {
         const painted = mask.blur > 0
-          ? blurredCoverage(buffer.coverage.texture, ctx.uv, binding.maskBlur.mul(ctx.texel))
+          ? blurredCoverage(buffer.coverage.texture, ctx.uv, binding.maskBlur.mul(ctx.texel), true)
           : coverageOf(buffer, ctx)
         value = blendFloat(mask.paintBlend, value, painted)
       }
@@ -246,7 +255,7 @@ export class Compositor {
 // ---------------------------------------------------------------------------
 
 function coverageOf(buffer: PaintBuffer, ctx: BuildContext): F {
-  return blurredCoverage(buffer.coverage.texture, ctx.uv, null)
+  return blurredCoverage(buffer.coverage.texture, ctx.uv, null, true)
 }
 
 function axisIndex(axis: 'x' | 'y' | 'z'): 0 | 1 | 2 {

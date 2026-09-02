@@ -60,6 +60,7 @@ import { fbm01, voronoi2 } from '../procedural/noise'
 import type { MeshMaps } from './meshmaps'
 import type { F, V2, V4 } from './nodes'
 import { packBundle, unpackSlots } from './packing'
+import { rtUv } from './sampling'
 import { CoverageTarget, SlotTargets } from './targets'
 import type { PaintBuffer } from './targets'
 import { vec4ArrayUniform } from './bindings'
@@ -415,8 +416,9 @@ export class Painter {
     material.blending = NoBlending
 
     const uvNode = uv()
-    const strokeCoverage = texture(this.#stroke.texture, uvNode).x.mul(this.#strokeOpacity).clamp(0, 1)
-    const baseCoverage = texture(this.#baselineCoverage.texture, uvNode).x
+    const sampleUv = rtUv(uvNode)
+    const strokeCoverage = texture(this.#stroke.texture, sampleUv).x.mul(this.#strokeOpacity).clamp(0, 1)
+    const baseCoverage = texture(this.#baselineCoverage.texture, sampleUv).x
 
     const def = getMaterialDef(spec.defId)
     const brushBundle = def
@@ -431,12 +433,12 @@ export class Painter {
             rotation: float(spec.projection.rotation),
             sharpness: float(spec.projection.blendSharpness),
           },
-          maps: maps.nodes(uvNode),
-          uv: uvNode,
+          maps: maps.nodes(sampleUv),
+          uv: sampleUv,
         })
       : null
 
-    const baseBundle = unpackSlots(this.#baselineSlots.rt.textures, uvNode)
+    const baseBundle = unpackSlots(this.#baselineSlots.rt.textures, uvNode, true)
     const source = brushBundle ?? baseBundle
 
     // Standard "source over destination", un-premultiplied at the end so the
@@ -469,7 +471,7 @@ export class Painter {
     material.depthTest = false
     material.depthWrite = false
     material.blending = NoBlending
-    const uvNode = uv()
+    const uvNode = rtUv(uv())
     const stroke = texture(this.#stroke.texture, uvNode).x.mul(this.#strokeOpacity).clamp(0, 1)
     const base = texture(this.#baselineCoverage.texture, uvNode).x
     const erase = this.#eraseMode

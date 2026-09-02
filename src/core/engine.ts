@@ -27,6 +27,7 @@ import { Painter } from './gpu/painter'
 import type { BrushSettings, StrokeSample, StrokeTarget } from './gpu/painter'
 import { DEFAULT_BRUSH } from './gpu/painter'
 import { PaintBuffer } from './gpu/targets'
+import { clearTarget } from './gpu/uvspace'
 import { ViewportMaterials } from './gpu/viewport'
 import type { ViewMode } from './gpu/viewport'
 import { ProceduralEnvironment, ENVIRONMENT_PRESETS } from './gpu/environment'
@@ -226,7 +227,12 @@ export class Engine {
       const existing = this.#paintBuffers.get(id)
       if (existing && existing.kind === kind) continue
       existing?.dispose()
-      this.#paintBuffers.set(id, new PaintBuffer(id, kind, this.#resolution))
+      const buffer = new PaintBuffer(id, kind, this.#resolution)
+      this.#paintBuffers.set(id, buffer)
+      if (this.#renderer) {
+        clearTarget(this.#renderer, buffer.coverage.rt)
+        if (buffer.slots) clearTarget(this.#renderer, buffer.slots.rt)
+      }
       // A brand-new buffer starts empty, and the compositor must sample the
       // new texture object rather than the disposed one.
       this.#compositor.invalidateGraph()
@@ -507,13 +513,20 @@ export class Engine {
   raycast(origin: [number, number, number], direction: [number, number, number]): SurfaceHit | null {
     const geometry = this.geometry
     if (!geometry) return null
+    this.mesh.updateMatrixWorld(true)
     this.#raycaster.set(new Vector3(...origin), new Vector3(...direction).normalize())
     const hits = this.#raycaster.intersectObject(this.mesh, false)
     const hit = hits[0]
     if (!hit) return null
-    const normal = hit.normal
-      ? new Vector3(hit.normal.x, hit.normal.y, hit.normal.z).normalize()
-      : new Vector3(0, 0, 1)
+    const normal = new Vector3()
+    if (hit.normal) {
+      // `hit.normal` is interpolated in object space.
+      normal.copy(hit.normal).transformDirection(this.mesh.matrixWorld).normalize()
+    } else if (hit.face) {
+      normal.copy(hit.face.normal).transformDirection(this.mesh.matrixWorld).normalize()
+    } else {
+      normal.set(0, 0, 1)
+    }
     return {
       point: [hit.point.x, hit.point.y, hit.point.z],
       normal: [normal.x, normal.y, normal.z],

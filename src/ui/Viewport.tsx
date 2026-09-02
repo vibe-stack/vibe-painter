@@ -78,6 +78,10 @@ function Stage({ api, tool, onPaintBlocked }: ViewportProps & { api: VibePainter
     return () => instance.dispose()
   }, [api, camera, gl])
 
+  useEffect(() => {
+    if (controls.current) controls.current.enabled = tool === 'orbit'
+  }, [tool])
+
   // Attach inside the render loop, after the canvas has presented at least
   // once (useEffect runs too early, and Strict Mode would attach/detach
   // before a frame). Parent first so the engine can set scene.environment.
@@ -97,6 +101,7 @@ function Stage({ api, tool, onPaintBlocked }: ViewportProps & { api: VibePainter
     const hitAt = (event: PointerEvent) => {
       const rect = element.getBoundingClientRect()
       ndc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1)
+      camera.updateMatrixWorld()
       raycaster.setFromCamera(ndc, camera)
       const { origin, direction } = raycaster.ray
       return api.raycast([origin.x, origin.y, origin.z], [direction.x, direction.y, direction.z])
@@ -113,9 +118,9 @@ function Stage({ api, tool, onPaintBlocked }: ViewportProps & { api: VibePainter
         return
       }
       painting.current = true
-      if (controls.current) controls.current.enabled = false
       element.setPointerCapture(event.pointerId)
       event.preventDefault()
+      event.stopPropagation()
     }
 
     const onMove = (event: PointerEvent) => {
@@ -129,20 +134,18 @@ function Stage({ api, tool, onPaintBlocked }: ViewportProps & { api: VibePainter
       if (!painting.current) return
       painting.current = false
       api.endStroke()
-      if (controls.current) controls.current.enabled = true
       if (element.hasPointerCapture(event.pointerId)) element.releasePointerCapture(event.pointerId)
     }
 
-    element.addEventListener('pointerdown', onDown)
-    element.addEventListener('pointermove', onMove)
-    element.addEventListener('pointerup', onUp)
-    element.addEventListener('pointercancel', onUp)
+    element.addEventListener('pointerdown', onDown, { capture: true })
+    element.addEventListener('pointermove', onMove, { capture: true })
+    element.addEventListener('pointerup', onUp, { capture: true })
+    element.addEventListener('pointercancel', onUp, { capture: true })
     return () => {
-      element.removeEventListener('pointerdown', onDown)
-      element.removeEventListener('pointermove', onMove)
-      element.removeEventListener('pointerup', onUp)
-      element.removeEventListener('pointercancel', onUp)
-      if (controls.current) controls.current.enabled = true
+      element.removeEventListener('pointerdown', onDown, { capture: true })
+      element.removeEventListener('pointermove', onMove, { capture: true })
+      element.removeEventListener('pointerup', onUp, { capture: true })
+      element.removeEventListener('pointercancel', onUp, { capture: true })
     }
   }, [api, camera, gl, ndc, raycaster, tool, onPaintBlocked])
 
