@@ -95,7 +95,7 @@ export const rustedIron = registerMaterial({
     { key: 'edgeSoftness', label: 'Edge Softness', type: 'float', default: 0.12, min: 0.005, max: 0.5, step: 0.001, group: 'Corrosion' },
     { key: 'scale', label: 'Scale', type: 'float', default: 5, min: 0.2, max: 60, step: 0.1, group: 'Corrosion' },
     { key: 'warpAmount', label: 'Warp', type: 'float', default: 0.45, min: 0, max: 2, step: 0.01, group: 'Corrosion', description: 'Distorts the corrosion field so the boundary meanders instead of drawing smooth blobs.' },
-    { key: 'crust', label: 'Crust Height', type: 'float', default: 0.5, min: 0, max: 1, step: 0.01, group: 'Surface' },
+    { key: 'crust', label: 'Crust Height', type: 'float', default: 0.35, min: 0, max: 1, step: 0.01, group: 'Surface' },
     SEED_PARAM,
   ],
   build(ctx): PartialBundle {
@@ -114,7 +114,7 @@ export const rustedIron = registerMaterial({
     const rust = rustAt(ctx.uv)
     // Crust rides on top of the metal, so height only rises where rust is.
     const crustAt = (uvNode: V2): F => {
-      const grain = ridged(vec3(uvNode.mul(scale.mul(6)), seedOffset(ctx)), float(4), float(0.5))
+      const grain = ridged(vec3(uvNode.mul(scale.mul(2.5)), seedOffset(ctx)), float(4), float(0.55))
       return rustAt(uvNode).mul(grain.mul(p.float('crust')))
     }
 

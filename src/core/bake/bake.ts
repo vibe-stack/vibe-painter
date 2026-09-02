@@ -73,12 +73,18 @@ function radicalInverse(bits: number): number {
  * Signed so that positive is convex (edges) and negative is concave (cracks) -
  * that sign is the whole reason curvature drives edge wear and cavity dirt
  * from a single map.
+ *
+ * The result is then normalised against the mesh's own mean curvature rather
+ * than a fixed constant. A fixed scale cannot work: the raw value is roughly
+ * `1/(2 x feature radius)`, so a thin tube produces numbers several times
+ * larger than a big smooth form and clamps to solid white everywhere, which
+ * carries no information at all. Self-calibrating keeps the interesting range
+ * spread across the map whatever the model's scale.
  */
 function computeVertexCurvature(
   geometry: BakeGeometry,
-  boundingRadius: number,
   intensity: number,
-  smoothing: number,
+  smoothingPasses: number,
 ): Float32Array {
   const { positions, normals, indices } = geometry
   const vertexCount = positions.length / 3
@@ -110,12 +116,13 @@ function computeVertexCurvature(
 
   let curvature = new Float32Array(vertexCount)
   for (let v = 0; v < vertexCount; v++) {
-    curvature[v] = count[v] > 0 ? (sum[v] / count[v]) * boundingRadius * intensity : 0
+    curvature[v] = count[v] > 0 ? sum[v] / count[v] : 0
   }
 
-  // Laplacian smoothing over the edge graph. Vertex curvature is noisy on
-  // irregular tessellation, and the maps it feeds are low frequency anyway.
-  for (let pass = 0; pass < smoothing; pass++) {
+  // Laplacian smoothing over the edge graph. More passes means a larger
+  // effective search radius, which is exactly what "curvature radius" means to
+  // someone tuning an edge-wear mask.
+  for (let pass = 0; pass < smoothingPasses; pass++) {
     const next = new Float32Array(vertexCount)
     const n = new Uint32Array(vertexCount)
     for (let t = 0; t < indices.length; t += 3) {
@@ -129,6 +136,20 @@ function computeVertexCurvature(
     }
     curvature = next
   }
+
+  // Normalise against the mesh's own mean absolute curvature. Three times the
+  // mean reaches the end of the range, which keeps ordinary surface just off
+  // neutral and leaves headroom for genuine edges.
+  let total = 0
+  let counted = 0
+  for (let v = 0; v < vertexCount; v++) {
+    if (count[v] === 0) continue
+    total += Math.abs(curvature[v])
+    counted++
+  }
+  const meanAbs = counted > 0 ? total / counted : 0
+  const scale = meanAbs > 1e-9 ? intensity / (meanAbs * 3) : 0
+  for (let v = 0; v < vertexCount; v++) curvature[v] *= scale
 
   return curvature
 }
@@ -165,12 +186,10 @@ export function bakeRows(request: BakeRequest, onProgress?: (fraction: number) =
   const boundingRadius = Math.max(1e-5, diagonal * 0.5)
 
   const bvh = new Bvh({ positions, indices })
-  const curvature = computeVertexCurvature(
-    geometry,
-    boundingRadius * settings.curvatureRadius,
-    settings.curvatureIntensity,
-    2,
-  )
+  // Radius maps to smoothing passes: more smoothing averages curvature over a
+  // wider neighbourhood, which is what a larger search radius means here.
+  const smoothingPasses = Math.max(0, Math.min(16, Math.round(settings.curvatureRadius * 3)))
+  const curvature = computeVertexCurvature(geometry, settings.curvatureIntensity, smoothingPasses)
 
   const aoDistance = Math.max(1e-4, settings.aoDistance * boundingRadius)
   const thicknessDistance = boundingRadius * 2
@@ -239,7 +258,7 @@ export function bakeRows(request: BakeRequest, onProgress?: (fraction: number) =
 
         const index = ((py - rowStart) * size + px) * 4
         data[index] = ao
-        data[index + 1] = Math.min(1, Math.max(0, 0.5 + texelCurvature))
+        data[index + 1] = Math.min(1, Math.max(0, 0.5 + texelCurvature * 0.5))
         data[index + 2] = thickness
         data[index + 3] = 1
       }

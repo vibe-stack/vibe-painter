@@ -54,7 +54,15 @@ export default function App() {
     // is callable from the console or by an automation driving this page -
     // `vibePainter.describe()` lists the whole surface.
     ;(globalThis as unknown as { vibePainter: VibePainter }).vibePainter = api
-    return () => api.dispose()
+    const onPageHide = () => api.dispose()
+    window.addEventListener('pagehide', onPageHide)
+    return () => {
+      window.removeEventListener('pagehide', onPageHide)
+      delete (globalThis as unknown as { vibePainter?: VibePainter }).vibePainter
+      // Do not dispose here. React Strict Mode runs this cleanup and remounts
+      // with the same useMemo instance, which would leave a dead GPU engine
+      // on every full page load — HMR looked fine because it created a new one.
+    }
   }, [api])
 
   return (
@@ -138,7 +146,7 @@ function Workspace() {
 
       <main className="flex min-h-0 flex-1">
         <aside className="flex w-64 shrink-0 flex-col border-r border-neutral-800 bg-neutral-925">
-          <div className="min-h-0 flex-1">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
             <LayerPanel />
           </div>
         </aside>
@@ -172,7 +180,7 @@ function Workspace() {
               </button>
             ))}
           </nav>
-          <div className="min-h-0 flex-1 overflow-hidden">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
             {tab === 'Properties' && <PropertiesPanel />}
             {tab === 'Materials' && <MaterialBrowser />}
             {tab === 'Brush' && <BrushPanel />}

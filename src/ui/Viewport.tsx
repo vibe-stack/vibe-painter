@@ -56,12 +56,10 @@ function Stage({ api, tool, onPaintBlocked }: ViewportProps & { api: VibePainter
   const ndc = useMemo(() => new Vector2(), [])
 
   useEffect(() => {
-    api.attachRenderer(gl as unknown as WebGPURenderer)
-    scene.add(api.engine.root)
     return () => {
       scene.remove(api.engine.root)
     }
-  }, [api, gl, scene])
+  }, [api, scene])
 
   useEffect(() => {
     const instance = new OrbitControls(camera, gl.domElement)
@@ -80,9 +78,14 @@ function Stage({ api, tool, onPaintBlocked }: ViewportProps & { api: VibePainter
     return () => instance.dispose()
   }, [api, camera, gl])
 
-  // Priority 0 keeps react-three-fiber's own render; our callback simply runs
-  // before it, which is exactly when the composite needs to be up to date.
+  // Attach inside the render loop, after the canvas has presented at least
+  // once (useEffect runs too early, and Strict Mode would attach/detach
+  // before a frame). Parent first so the engine can set scene.environment.
   useFrame(() => {
+    if (api.engine.root.parent !== scene) {
+      scene.add(api.engine.root)
+      api.attachRenderer(gl as unknown as WebGPURenderer)
+    }
     controls.current?.update()
     api.engine.update()
   })

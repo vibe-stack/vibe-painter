@@ -63,7 +63,7 @@ function clamp01(n: number): number {
   return Math.min(1, Math.max(0, n))
 }
 
-type UniformHandle = { value: unknown; name: string }
+type UniformHandle = { value: unknown }
 
 /**
  * Live uniform bindings for one material (or generator) instance.
@@ -131,10 +131,11 @@ export class ParamBag {
       const initial = this.#uniformValue(def, this.#values[def.key])
       // `uniform()` is overloaded per value type; the bag is deliberately
       // type-erased here and re-typed by `float()` / `color()`.
+      // Deliberately unnamed: the same parameter key appears on every layer
+      // using a given material, and TSL logs a rename warning for each clash.
       handle = (typeof initial === 'number'
         ? uniform(initial)
         : uniform(initial)) as unknown as UniformHandle
-      handle.name = def.key
       this.#uniforms.set(def.key, handle)
     }
     return handle

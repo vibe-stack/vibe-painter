@@ -56,8 +56,8 @@ export function BakePanel() {
       <Slider label="AO Rays" hint="More rays means less noise and a longer bake. Stratified sampling makes 32 go a long way." value={settings.aoRays} min={8} max={256} step={1} onChange={(aoRays) => patch({ aoRays: Math.round(aoRays) })} />
       <Slider label="AO Distance" hint="Fraction of the model size a ray may travel before it counts as unoccluded." value={settings.aoDistance} min={0.02} max={2} step={0.01} onChange={(aoDistance) => patch({ aoDistance })} />
       <Slider label="Thickness Rays" value={settings.thicknessRays} min={0} max={128} step={1} onChange={(thicknessRays) => patch({ thicknessRays: Math.round(thicknessRays) })} />
-      <Slider label="Curvature Intensity" value={settings.curvatureIntensity} min={0.05} max={6} step={0.01} onChange={(curvatureIntensity) => patch({ curvatureIntensity })} />
-      <Slider label="Curvature Radius" hint="Scales the searchable radius relative to the model size." value={settings.curvatureRadius} min={0.05} max={4} step={0.01} onChange={(curvatureRadius) => patch({ curvatureRadius })} />
+      <Slider label="Curvature Contrast" hint="Curvature is normalised against the mesh\u2019s own average, so this is contrast rather than an absolute scale." value={settings.curvatureIntensity} min={0.05} max={6} step={0.01} onChange={(curvatureIntensity) => patch({ curvatureIntensity })} />
+      <Slider label="Curvature Radius" hint="How wide a neighbourhood curvature is averaged over. Larger picks up broad forms; smaller picks up fine creases." value={settings.curvatureRadius} min={0.05} max={4} step={0.01} onChange={(curvatureRadius) => patch({ curvatureRadius })} />
       <Slider label="Dilation" hint="How far results bleed past UV island borders." value={settings.dilation} min={0} max={32} step={1} onChange={(dilation) => patch({ dilation: Math.round(dilation) })} />
 
       <div className="flex items-center gap-2 px-3 py-2">

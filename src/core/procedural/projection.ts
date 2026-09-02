@@ -11,7 +11,7 @@
  * instead of recompiling the whole stack's shader on every mouse move.
  */
 
-import { abs, cos, float, max, normalize, sin, vec2, vec3 } from 'three/tsl'
+import { abs, cos, dFdx, dFdy, float, length, max, mix, normalize, sin, step, vec2, vec3 } from 'three/tsl'
 import type { Projection } from '../doc/types'
 import type { ChannelBundle, F, V2, V3 } from '../gpu/nodes'
 import { completeBundle } from '../gpu/nodes'
@@ -57,7 +57,6 @@ export interface BuildArgs {
   nodes: ProjectionNodes
   maps: MeshMapNodes
   uv: V2
-  texel: F
 }
 
 /** Evaluates a material under its projection and returns a complete bundle. */
@@ -76,8 +75,19 @@ export function buildProjected(args: BuildArgs): ChannelBundle {
   }
 }
 
+/**
+ * Materials use `ctx.texel` as the epsilon for height derivatives, so it has to
+ * be measured in *their* coordinate space, not in UV texels.
+ *
+ * Both places a material is evaluated - the compositor and the paint commit -
+ * are fullscreen passes over UV space, so a screen-space derivative of the
+ * projected coordinate is exactly "how far this coordinate moves per texel".
+ * Getting this wrong is very visible: under triplanar the coordinate is in
+ * world units, and a UV-sized epsilon turns every height field into noise.
+ */
 function contextFor(args: BuildArgs, coord: V2, axis: number): MatContext {
-  return { uv: coord, texel: args.texel, params: args.params, meshMaps: args.maps, axis }
+  const perTexel = max(length(dFdx(coord)), length(dFdy(coord)))
+  return { uv: coord, texel: max(perTexel, float(1e-6)), params: args.params, meshMaps: args.maps, axis }
 }
 
 function buildUV(args: BuildArgs): ChannelBundle {
@@ -137,7 +147,10 @@ function buildTriplanar(args: BuildArgs): ChannelBundle {
 
   const sharp = max(args.nodes.sharpness, float(1))
   const raw = abs(n).pow(vec3(sharp, sharp, sharp))
-  const weights = raw.div(max(raw.x.add(raw.y).add(raw.z), float(1e-4)))
+  const sum = raw.x.add(raw.y).add(raw.z)
+  // Empty geometry maps (a WebGPU first-draw miss) leave n = 0, which would
+  // zero every weight and composite the surface to black. Fall back to +Z.
+  const weights = mix(vec3(0, 0, 1), raw.div(max(sum, float(1e-4))), step(float(1e-4), sum))
 
   const bundles = ([0, 1, 2] as const).map((axis) =>
     completeBundle(args.def.build(contextFor(args, transform2D(planeCoord(p, axis), args.nodes), axis))),

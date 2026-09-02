@@ -35,9 +35,10 @@ export class RayBaker {
 
   get workerCount(): number {
     const cores = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency || 4 : 4
-    // Leave a core for the main thread; more than four workers gives little
-    // back once memory bandwidth on the shared BVH copies dominates.
-    return Math.max(1, Math.min(4, cores - 1))
+    // Leave a core for the main thread. Ray tracing here is compute bound, so
+    // it scales almost linearly with workers; the cap only avoids spawning an
+    // absurd number of them on a very large machine.
+    return Math.max(1, Math.min(8, cores - 1))
   }
 
   cancel(): void {

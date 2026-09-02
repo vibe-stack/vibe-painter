@@ -185,7 +185,6 @@ export class Compositor {
             nodes,
             maps: ctx.mapNodes,
             uv: ctx.uv,
-            texel: ctx.texel,
           })
         }
       } else {

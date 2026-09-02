@@ -433,7 +433,6 @@ export class Painter {
           },
           maps: maps.nodes(uvNode),
           uv: uvNode,
-          texel: float(1 / Math.max(1, this.#stroke.resolution)),
         })
       : null
 

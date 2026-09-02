@@ -202,20 +202,35 @@ export const DEFAULT_LEVELS: Levels = { inLow: 0, inHigh: 1, gamma: 1, outLow: 0
 
 export const DEFAULT_CHANNEL_SETTINGS: ChannelSettings = { enabled: true, opacity: 1, blend: 'normal' }
 
+/**
+ * Triplanar by default. UV projection is the "correct" mode for a properly
+ * unwrapped production mesh, but every built-in primitive here has wildly
+ * uneven UV density - a torus knot stretches a pattern into streaks along the
+ * tube - and triplanar never stretches. One dropdown switches back.
+ */
 export const DEFAULT_PROJECTION: ProjectionSettings = {
-  mode: 'uv',
-  scale: [1, 1],
+  mode: 'triplanar',
+  scale: [1.6, 1.6],
   offset: [0, 0],
   rotation: 0,
   blendSharpness: 4,
   axis: 'y',
 }
 
+/**
+ * Defaults chosen for a bake that finishes in a few seconds rather than one
+ * that is theoretically ideal.
+ *
+ * Mesh maps are low-frequency by nature - they feed masks, not detail - so a
+ * lower resolution costs very little visually and costs four times less per
+ * doubling. The ray budget is the wall-clock time; the bake panel exposes all
+ * of it for when quality matters more than the wait.
+ */
 export const DEFAULT_BAKE_SETTINGS: BakeSettings = {
-  resolution: 512,
-  aoRays: 48,
+  resolution: 384,
+  aoRays: 32,
   aoDistance: 0.5,
-  thicknessRays: 32,
+  thicknessRays: 12,
   curvatureRadius: 1,
   curvatureIntensity: 1,
   dilation: 12,

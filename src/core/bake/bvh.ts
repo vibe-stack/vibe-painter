@@ -8,7 +8,7 @@
  * Runs in a worker, so it must not touch three.js or the DOM.
  */
 
-const LEAF_SIZE = 4
+const LEAF_SIZE = 8
 const STACK_SIZE = 64
 
 export interface BvhGeometry {
@@ -91,16 +91,46 @@ export class Bvh {
       return node
     }
 
-    // Median split on the widest centroid axis. Not a full SAH build, but it
-    // is O(n log n) with a tiny constant and the ray cost difference on the
-    // meshes this app handles is small.
+    // Spatial-median split on the widest centroid axis, partitioned in place.
+    //
+    // An object-median split would need a sort per node, and `Array.from` +
+    // `sort` allocates at every level of the tree - which dominated build time
+    // on a 25k-triangle mesh. A midpoint partition is O(n) with no allocation
+    // and builds a comparable tree; it only needs the object-median fallback
+    // below when the centroids all land on one side.
     const ex = maxX - minX, ey = maxY - minY, ez = maxZ - minZ
     const axis = ex > ey ? (ex > ez ? 0 : 2) : ey > ez ? 1 : 2
-    const slice = this.order.subarray(start, start + count)
-    const sorted = Array.from(slice).sort((a, c) => centroids[a * 3 + axis] - centroids[c * 3 + axis])
-    slice.set(sorted)
 
-    const mid = count >> 1
+    let centroidMin = Infinity
+    let centroidMax = -Infinity
+    for (let i = start; i < start + count; i++) {
+      const c = centroids[this.order[i] * 3 + axis]
+      if (c < centroidMin) centroidMin = c
+      if (c > centroidMax) centroidMax = c
+    }
+
+    let mid: number
+    if (centroidMax - centroidMin < 1e-12) {
+      // Every centroid coincides: nothing to separate, so split by count.
+      mid = count >> 1
+    } else {
+      const pivot = (centroidMin + centroidMax) * 0.5
+      let left = start
+      let right = start + count - 1
+      while (left <= right) {
+        if (centroids[this.order[left] * 3 + axis] < pivot) {
+          left++
+        } else {
+          const tmp = this.order[left]
+          this.order[left] = this.order[right]
+          this.order[right] = tmp
+          right--
+        }
+      }
+      mid = left - start
+      // A degenerate partition would recurse forever; fall back to a halving.
+      if (mid === 0 || mid === count) mid = count >> 1
+    }
     const left = this.build(start, mid, centroids)
     const right = this.build(start + mid, count - mid, centroids)
     // Written after recursion: both child indices are known only then, and

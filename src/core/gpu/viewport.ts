@@ -16,11 +16,13 @@
 import { MeshPhysicalNodeMaterial, MeshBasicNodeMaterial, Vector2 } from 'three/webgpu'
 import type { Texture } from 'three/webgpu'
 import {
+  bitangentView,
   float,
+  mat3,
   normalize,
-  pmremTexture,
+  normalView,
+  tangentView,
   texture,
-  transformNormalToView,
   uniform,
   uv,
   vec2,
@@ -85,7 +87,7 @@ export class ViewportMaterials {
   }
 
   /** (Re)binds the material graphs to a set of composited targets. */
-  build(slots: SlotTargets, maps: MeshMaps, environment: Texture | null): void {
+  build(slots: SlotTargets, maps: MeshMaps): void {
     const uvNode = uv()
     this.#texel.value.set(1 / slots.resolution, 1 / slots.resolution)
     const bundle = unpackSlots(slots.rt.textures, uvNode)
@@ -103,11 +105,26 @@ export class ViewportMaterials {
     this.shaded.colorNode = bundle.baseColor as V3
     this.shaded.roughnessNode = (bundle.roughness as F).clamp(0.015, 1)
     this.shaded.metalnessNode = (bundle.metallic as F).clamp(0, 1)
-    this.shaded.aoNode = (bundle.ao as F).clamp(0, 1)
+    // Uncleared composite targets are 0. AO of 0 kills IBL; a 0 tangent
+    // normal normalises to NaN and kills direct lighting too.
+    this.shaded.aoNode = (bundle.ao as F).max(0.04).clamp(0, 1)
     this.shaded.emissiveNode = bundle.emissive as V3
-    this.shaded.normalNode = transformNormalToView(combined)
-    this.shaded.opacityNode = (bundle.opacity as F).clamp(0, 1)
-    if (environment) this.shaded.envNode = pmremTexture(environment)
+    // Compositor stores tangent-space normals. TBN * n is the correct
+    // transform; `transformNormalToView` is object-space and flattened the
+    // whole mesh to +Z, which reads as a black silhouette under PBR.
+    const tangentNormal = vec3(combined.x, combined.y, (combined.z as F).max(0.02))
+    this.shaded.normalNode = mat3(
+      tangentView as unknown as V3,
+      bitangentView as unknown as V3,
+      normalView as unknown as V3,
+    ).mul(normalize(tangentNormal)).normalize()
+    this.shaded.opacityNode = (bundle.opacity as F).max(0.02).clamp(0, 1)
+    // IBL comes from `scene.environment` (set by the engine). Binding envNode
+    // here double-wrapped PMREM and compiled a black shader on cold start.
+    // Punctual lights come from the scene graph, not a captured LightsNode —
+    // capturing them by constructor identity breaks when Vite duplicates three.
+    this.shaded.envNode = null
+    this.shaded.lightsNode = null
     this.shaded.needsUpdate = true
 
     // --- Debug / channel solo -------------------------------------------

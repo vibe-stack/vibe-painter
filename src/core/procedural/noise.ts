@@ -81,10 +81,12 @@ export function fbm01(p: V3, octaves = 4, lacunarity = 2, gain = 0.5): F {
  * makes rock, rust crust and cracked paint read as *broken* rather than lumpy.
  */
 export const ridged = /*#__PURE__*/ Fn(([p, octaves, gain]: [V3, F, F]): F => {
-  const sum = float(0).toVar('ridgeSum')
-  const amp = float(0.5).toVar('ridgeAmp')
-  const freq = float(1).toVar('ridgeFreq')
-  const norm = float(0).toVar('ridgeNorm')
+  // Unnamed vars: TSL renames explicit duplicates and logs a warning for each,
+  // and this function is inlined many times per material.
+  const sum = float(0).toVar()
+  const amp = float(0.5).toVar()
+  const freq = float(1).toVar()
+  const norm = float(0).toVar()
   Loop({ start: 0, end: 8, type: 'int' }, ({ i }) => {
     If(float(i).lessThan(octaves), () => {
       const n = abs(mx_noise_float(p.mul(freq))).oneMinus()

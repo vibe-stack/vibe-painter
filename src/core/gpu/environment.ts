@@ -11,7 +11,7 @@
  * reflect. IBL is what makes the metal materials in the catalogue readable.
  */
 
-import { CubeRenderTarget, HalfFloatType, LinearFilter, MeshBasicNodeMaterial, NoBlending, QuadMesh, RenderTarget, Vector3, EquirectangularReflectionMapping, NoColorSpace } from 'three/webgpu'
+import { CubeRenderTarget, HalfFloatType, LinearFilter, MeshBasicNodeMaterial, NoBlending, PMREMGenerator, QuadMesh, RenderTarget, Vector3, EquirectangularReflectionMapping, NoColorSpace } from 'three/webgpu'
 import type { Renderer, Texture } from 'three/webgpu'
 import { exp, float, max, mix, smoothstep, uniform, uv, vec3, vec4 } from 'three/tsl'
 import { fbm01 } from '../procedural/noise'
@@ -34,9 +34,9 @@ export interface EnvironmentSettings {
 
 export const ENVIRONMENT_PRESETS: Record<string, EnvironmentSettings> = {
   studio: {
-    sunElevation: 45, sunAzimuth: 130, sunIntensity: 6, sunSize: 0.09,
-    skyColor: [0.62, 0.66, 0.72], horizonColor: [0.78, 0.78, 0.8], groundColor: [0.22, 0.22, 0.24],
-    intensity: 1, clouds: 0,
+    sunElevation: 38, sunAzimuth: 40, sunIntensity: 20, sunSize: 0.05,
+    skyColor: [0.42, 0.5, 0.62], horizonColor: [0.78, 0.78, 0.8], groundColor: [0.16, 0.16, 0.18],
+    intensity: 1.0, clouds: 0,
   },
   sunset: {
     sunElevation: 6, sunAzimuth: 250, sunIntensity: 14, sunSize: 0.05,
@@ -58,6 +58,8 @@ export const ENVIRONMENT_PRESETS: Record<string, EnvironmentSettings> = {
 export class ProceduralEnvironment {
   #equirect: RenderTarget
   #cube: CubeRenderTarget
+  #pmrem: PMREMGenerator | null = null
+  #envTarget: RenderTarget | null = null
   #quad = new QuadMesh()
   #material: MeshBasicNodeMaterial
 
@@ -87,8 +89,19 @@ export class ProceduralEnvironment {
     this.#material = this.#buildMaterial()
   }
 
+  /** Cube map, used as the scene background. */
   get texture(): Texture {
     return this.#cube.texture
+  }
+
+  /**
+   * Pre-filtered environment for PBR. Generating this up front (rather than
+   * lazily inside the material graph) is what keeps metals and diffuse
+   * surfaces from rendering black: `pmremTexture()` on a cube render-target
+   * is not always ready the first time the viewport shader compiles.
+   */
+  get envMap(): Texture | null {
+    return this.#envTarget?.texture ?? null
   }
 
   get equirectTexture(): Texture {
@@ -116,7 +129,7 @@ export class ProceduralEnvironment {
     this.#clouds.value = settings.clouds
   }
 
-  /** Regenerates the sky and its pre-filtered cube map. */
+  /** Regenerates the sky, cube background, and pre-filtered IBL map. */
   build(renderer: Renderer): void {
     const previous = renderer.getRenderTarget()
     renderer.setRenderTarget(this.#equirect)
@@ -124,6 +137,8 @@ export class ProceduralEnvironment {
     this.#quad.render(renderer)
     renderer.setRenderTarget(previous)
     this.#cube.fromEquirectangularTexture(renderer, this.#equirect.texture)
+    if (!this.#pmrem) this.#pmrem = new PMREMGenerator(renderer)
+    this.#envTarget = this.#pmrem.fromEquirectangular(this.#equirect.texture, this.#envTarget)
     this.#built = true
   }
 
@@ -168,6 +183,10 @@ export class ProceduralEnvironment {
   dispose(): void {
     this.#equirect.dispose()
     this.#cube.dispose()
+    this.#envTarget?.dispose()
+    this.#envTarget = null
+    this.#pmrem?.dispose()
+    this.#pmrem = null
     this.#material.dispose()
   }
 }

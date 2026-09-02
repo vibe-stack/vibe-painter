@@ -9,7 +9,7 @@ import type { ReactNode } from 'react'
 
 export function Panel({ title, children, actions }: { title: string; children: ReactNode; actions?: ReactNode }) {
   return (
-    <section className="flex min-h-0 flex-col">
+    <section className="flex h-full min-h-0 flex-col">
       <header className="flex items-center justify-between border-b border-neutral-800 bg-neutral-900/60 px-3 py-2">
         <h2 className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400">{title}</h2>
         {actions}

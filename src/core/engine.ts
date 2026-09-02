@@ -13,7 +13,7 @@
  */
 
 import { Box3, Mesh, Object3D, Raycaster, Vector3 } from 'three/webgpu'
-import type { BufferGeometry, Renderer } from 'three/webgpu'
+import type { BufferGeometry, Renderer, Scene } from 'three/webgpu'
 import { Emitter } from './emitter'
 import type { BakeSettings, LayerState, ProjectState, TextureSetState } from './doc/types'
 import { DEFAULT_BAKE_SETTINGS } from './doc/types'
@@ -30,6 +30,7 @@ import { PaintBuffer } from './gpu/targets'
 import { ViewportMaterials } from './gpu/viewport'
 import type { ViewMode } from './gpu/viewport'
 import { ProceduralEnvironment, ENVIRONMENT_PRESETS } from './gpu/environment'
+import { LightRig } from './gpu/lighting'
 import type { EnvironmentSettings } from './gpu/environment'
 import { RayBaker } from './bake/baker'
 import type { BakeProgress } from './bake/baker'
@@ -72,6 +73,7 @@ export class Engine {
   #geometryBaker = new GeometryBaker()
   #rayBaker = new RayBaker()
   #environment = new ProceduralEnvironment()
+  #lights = new LightRig()
   #viewport = new ViewportMaterials()
   #paintBuffers = new Map<string, PaintBuffer>()
   #raycaster = new Raycaster()
@@ -86,6 +88,18 @@ export class Engine {
   #resolution: number
   #needsViewportRebuild = true
   #baking = false
+  #showBackground = true
+  #backgroundPending = true
+  /**
+   * WebGPU compiles pipelines asynchronously and *skips* the first draw of a
+   * new shader. Env, geometry bake and the composite are one-shot, so a cold
+   * start would leave every target at clear-color (black) forever. Retry with
+   * the same compiled materials — rebuilding the graph each frame would skip
+   * every draw again.
+   */
+  static readonly #WARMUP_FRAMES = 4
+  #gpuWarmup = 0
+  #disposed = false
 
   constructor(project: ProjectState, resolution = 1024) {
     this.project = project
@@ -98,6 +112,8 @@ export class Engine {
 
     this.mesh.frustumCulled = false
     this.root.add(this.mesh)
+    this.root.add(this.#lights.group)
+    this.#lights.apply(this.#environmentSettings)
   }
 
   // -- lifecycle ----------------------------------------------------------
@@ -127,14 +143,14 @@ export class Engine {
   }
 
   attachRenderer(renderer: Renderer): void {
-    if (this.#renderer === renderer) return
     this.#renderer = renderer
     this.#environment.apply(this.#environmentSettings)
-    this.#environment.build(renderer)
-    if (this.mesh.geometry && this.mesh.geometry.getAttribute('position')) {
-      this.#bakeGeometry()
-    }
+    this.#lights.apply(this.#environmentSettings)
     this.#needsViewportRebuild = true
+    // Always restart warmup: Strict Mode remounts with the same renderer, and
+    // the first attach often runs before the canvas has presented a frame.
+    this.#gpuWarmup = Engine.#WARMUP_FRAMES
+    this.#applyBackground()
     this.sync('renderer attached')
   }
 
@@ -236,14 +252,24 @@ export class Engine {
     const set = this.activeTextureSet
     if (!renderer || !set) return
 
+    if (this.#gpuWarmup > 0) {
+      const first = this.#gpuWarmup === Engine.#WARMUP_FRAMES
+      this.#environment.build(renderer)
+      this.#applyBackground()
+      if (this.geometry) this.#bakeGeometry({ silent: !first, rebuildGraph: first })
+      // Re-draw with the *same* compiled shaders. invalidateGraph() would
+      // dispose the material every frame, so every retry would be another
+      // skipped first draw and the targets would stay black forever.
+      if (!first) this.#compositor.invalidate()
+      this.#gpuWarmup--
+    } else if (this.#backgroundPending) {
+      this.#applyBackground()
+    }
+
     const changed = this.#compositor.render(renderer, set, this.#meshMaps, this.#paintBuffers)
 
     if (this.#needsViewportRebuild) {
-      this.#viewport.build(
-        this.#compositor.output,
-        this.#meshMaps,
-        this.#environment.built ? this.#environment.texture : null,
-      )
+      this.#viewport.build(this.#compositor.output, this.#meshMaps)
       this.#viewport.setMode(this.#viewMode)
       this.#needsViewportRebuild = false
       this.#applyViewMode()
@@ -277,6 +303,34 @@ export class Engine {
 
   // -- environment --------------------------------------------------------
 
+  /** Whether the generated sky is drawn behind the model. */
+  get showBackground(): boolean {
+    return this.#showBackground
+  }
+
+  setShowBackground(value: boolean): void {
+    this.#showBackground = value
+    this.#applyBackground()
+  }
+
+  /**
+   * Applied lazily: the engine is given a renderer before its root is parented
+   * into a scene, so there is nothing to set the background on at that point.
+   */
+  #applyBackground(): void {
+    const scene = this.root.parent as Scene | null
+    if (!scene?.isScene) {
+      this.#backgroundPending = true
+      return
+    }
+    this.#backgroundPending = false
+    scene.background = this.#showBackground && this.#environment.built ? this.#environment.texture : null
+    // IBL is a scene property, not a background one: the sky can be hidden
+    // without turning the model black.
+    scene.environment = this.#environment.built ? this.#environment.envMap : null
+    scene.environmentIntensity = this.#environmentSettings.intensity
+  }
+
   get environmentSettings(): EnvironmentSettings {
     return { ...this.#environmentSettings }
   }
@@ -284,17 +338,19 @@ export class Engine {
   setEnvironment(settings: Partial<EnvironmentSettings>): void {
     this.#environmentSettings = { ...this.#environmentSettings, ...settings }
     this.#environment.apply(this.#environmentSettings)
+    this.#lights.apply(this.#environmentSettings)
     if (this.#renderer) {
       this.#environment.build(this.#renderer)
       // PMREM output is bound by reference, so the material graph only needs a
       // rebuild the first time an environment appears.
       if (!this.#viewport.built) this.#needsViewportRebuild = true
+      this.#applyBackground()
     }
   }
 
   // -- baking -------------------------------------------------------------
 
-  #bakeGeometry(): void {
+  #bakeGeometry(options: { silent?: boolean; rebuildGraph?: boolean } = {}): void {
     const renderer = this.#renderer
     const geometry = this.geometry
     if (!renderer || !geometry) return
@@ -302,9 +358,10 @@ export class Engine {
     // Without dilation the gutter is empty, and bilinear filtering pulls it
     // into every island edge as a dark rim.
     this.#dilator.dilateGeometry(renderer, this.#meshMaps, 16)
-    this.#compositor.invalidateGraph()
-    this.#needsViewportRebuild = true
-    this.events.emit('bakeComplete', { kind: 'geometry' })
+    if (options.rebuildGraph === false) this.#compositor.invalidate()
+    else this.#compositor.invalidateGraph()
+    if (options.rebuildGraph !== false) this.#needsViewportRebuild = true
+    if (!options.silent) this.events.emit('bakeComplete', { kind: 'geometry' })
   }
 
   async bakeMeshMaps(settings: Partial<BakeSettings> = {}): Promise<void> {
@@ -490,12 +547,15 @@ export class Engine {
   }
 
   dispose(): void {
+    if (this.#disposed) return
+    this.#disposed = true
     this.#compositor.dispose()
     this.#painter.dispose()
     this.#dilator.dispose()
     this.#geometryBaker.dispose()
     this.#meshMaps.dispose()
     this.#environment.dispose()
+    this.#lights.dispose()
     this.#viewport.dispose()
     for (const buffer of this.#paintBuffers.values()) buffer.dispose()
     this.#paintBuffers.clear()
