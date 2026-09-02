@@ -43,8 +43,10 @@ function transform2D(uvNode: V2, nodes: ProjectionNodes): V2 {
  * stores tangent-space normals, so every projection funnels through here.
  */
 function worldToTangent(worldNormal: V3, maps: MeshMapNodes): V3 {
+  // Geometry-map gutters are 0. Forcing a positive Z keeps the compositor
+  // from writing a NaN tangent-space normal that turns island edges black.
   return normalize(
-    vec3(worldNormal.dot(maps.tangent), worldNormal.dot(maps.bitangent), worldNormal.dot(maps.normal)),
+    vec3(worldNormal.dot(maps.tangent), worldNormal.dot(maps.bitangent), worldNormal.dot(maps.normal).max(0.2)),
   )
 }
 

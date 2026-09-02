@@ -26,7 +26,7 @@ export interface PrimitiveDef {
 }
 
 /** Gap left between UV islands so dilation has somewhere to bleed into. */
-const ATLAS_MARGIN = 0.01
+const ATLAS_MARGIN = 0.04
 
 function atlasBox(size = 1, segments = 24): BufferGeometry {
   const positions: number[] = []
@@ -72,7 +72,8 @@ function atlasBox(size = 1, segments = 24): BufferGeometry {
         const b = a + 1
         const c = a + segments + 1
         const d = c + 1
-        indices.push(a, c, b, b, c, d)
+        // a → b (+u) → c (+v) so (b-a)×(c-a) = u×v = outward normal.
+        indices.push(a, b, c, b, d, c)
       }
     }
   }
@@ -112,7 +113,7 @@ function atlasCylinder(radius = 0.6, height = 1.6, radial = 64, heightSegments =
       const b = a + 1
       const c = a + radial + 1
       const d = c + 1
-      indices.push(a, c, b, b, c, d)
+      indices.push(a, b, c, b, d, c)
     }
   }
 
@@ -136,8 +137,9 @@ function atlasCylinder(radius = 0.6, height = 1.6, radial = 64, heightSegments =
       const a = base
       const b = base + 1 + ix
       const c = base + 2 + ix
-      if (sign > 0) indices.push(a, c, b)
-      else indices.push(a, b, c)
+      // Top: a,b,c → +Y. Bottom: a,c,b → -Y. Same convention as three's CylinderGeometry.
+      if (sign > 0) indices.push(a, b, c)
+      else indices.push(a, c, b)
     }
   }
   cap(1, 0.25)

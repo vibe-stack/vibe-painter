@@ -144,14 +144,14 @@ export class Engine {
   }
 
   attachRenderer(renderer: Renderer): void {
+    const alreadyWarm = this.#renderer === renderer && this.#environment.built && this.#gpuWarmup === 0
     this.#renderer = renderer
     this.#environment.apply(this.#environmentSettings)
     this.#lights.apply(this.#environmentSettings)
-    this.#needsViewportRebuild = true
-    // Always restart warmup: Strict Mode remounts with the same renderer, and
-    // the first attach often runs before the canvas has presented a frame.
-    this.#gpuWarmup = Engine.#WARMUP_FRAMES
     this.#applyBackground()
+    if (alreadyWarm) return
+    this.#needsViewportRebuild = true
+    this.#gpuWarmup = Engine.#WARMUP_FRAMES
     this.sync('renderer attached')
   }
 
@@ -474,7 +474,7 @@ export class Engine {
       projection: this.#brushProjection,
     }, this.#brushParams)
     this.#painter.move(renderer, geometry, this.#meshMaps, sample)
-    this.#compositor.invalidate()
+    this.#compositeNow()
     return true
   }
 
@@ -483,7 +483,7 @@ export class Engine {
     const geometry = this.geometry
     if (!renderer || !geometry || !this.#painter.isStroking) return
     this.#painter.move(renderer, geometry, this.#meshMaps, sample)
-    this.#compositor.invalidate()
+    this.#compositeNow()
   }
 
   endStroke(): void {
@@ -491,9 +491,18 @@ export class Engine {
     if (!renderer) return
     const painted = this.#painter.end(renderer, this.#dilator, 8)
     if (painted) {
-      this.#compositor.invalidate()
+      this.#compositeNow()
       this.events.emit('documentChanged', { reason: 'stroke' })
     }
+  }
+
+  /** Flatten the stack immediately so a stroke is visible without waiting for the next frame. */
+  #compositeNow(): void {
+    const renderer = this.#renderer
+    const set = this.activeTextureSet
+    if (!renderer || !set) return
+    this.#compositor.invalidate()
+    this.#compositor.render(renderer, set, this.#meshMaps, this.#paintBuffers)
   }
 
   get brushProjection(): ProjectionSettings {

@@ -14,12 +14,16 @@
 
 import { OrthographicCamera, Scene, Mesh, DoubleSide } from 'three/webgpu'
 import type { BufferGeometry, Material, Renderer, RenderTarget } from 'three/webgpu'
-import { float, uv, vec4 } from 'three/tsl'
+import { cameraProjectionMatrix, float, uv, vec4 } from 'three/tsl'
 import type { V2, V4 } from './nodes'
 
 /** Clip-space position that rasterises a mesh into its own UV layout. */
 export function uvClipPosition(uvNode: V2 = uv()): V4 {
-  return vec4(uvNode.x.mul(2).sub(1), float(1).sub(uvNode.y.mul(2)), 0, 1)
+  // Same mapping as QuadMesh: a UV-space ortho quad, then the camera
+  // projection (so WebGPU's clip convention is applied). Writing NDC by
+  // hand skipped that and painted into the UV-v opposite of the click.
+  const p = vec4(uvNode.x.mul(2).sub(1), float(1).sub(uvNode.y.mul(2)), 0, 1)
+  return cameraProjectionMatrix.mul(p)
 }
 
 /**
