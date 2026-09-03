@@ -7,9 +7,10 @@
  * `src/core`, replaceable without touching it.
  */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { VIEW_MODES } from './core/gpu/viewport'
 import type { ViewMode } from './core/gpu/viewport'
+import { isGltfFileName } from './core/mesh/gltf'
 import { ApiProvider, useApi, useEngineVersion } from './ui/context'
 import { Viewport } from './ui/Viewport'
 import type { Tool } from './ui/Viewport'
@@ -61,6 +62,8 @@ function Workspace() {
   const [tool, setTool] = useState<Tool>('orbit')
   const [tab, setTab] = useState<RightTab>('Properties')
   const [notice, setNotice] = useState<string | null>(null)
+  const [dropActive, setDropActive] = useState(false)
+  const dropDepth = useRef(0)
   const viewMode = api.getViewMode()
 
   useEffect(() => {
@@ -128,8 +131,38 @@ function Workspace() {
           </div>
         </aside>
 
-        <section className="relative min-w-0 flex-1 bg-neutral-900">
+        <section
+          className="relative min-w-0 flex-1 bg-neutral-900"
+          onDragEnter={(event) => {
+            event.preventDefault()
+            dropDepth.current += 1
+            setDropActive(true)
+          }}
+          onDragOver={(event) => event.preventDefault()}
+          onDragLeave={() => {
+            dropDepth.current = Math.max(0, dropDepth.current - 1)
+            if (dropDepth.current === 0) setDropActive(false)
+          }}
+          onDrop={(event) => {
+            event.preventDefault()
+            dropDepth.current = 0
+            setDropActive(false)
+            const file = [...event.dataTransfer.files].find((candidate) => isGltfFileName(candidate.name))
+            if (!file) {
+              setNotice('Drop a .glb or .gltf file to replace the scene mesh.')
+              return
+            }
+            void api.importGltf(file).catch((cause) => {
+              setNotice(cause instanceof Error ? cause.message : String(cause))
+            })
+          }}
+        >
           <Viewport tool={tool} onPaintBlocked={setNotice} />
+          {dropActive && (
+            <div className="pointer-events-none absolute inset-3 z-10 flex items-center justify-center rounded border-2 border-dashed border-sky-500 bg-sky-950/50">
+              <p className="text-[13px] font-medium text-sky-100">Drop GLB to replace the mesh</p>
+            </div>
+          )}
           {notice && (
             <div className="pointer-events-none absolute inset-x-0 bottom-4 mx-auto w-fit rounded border border-amber-700 bg-amber-950/90 px-3 py-1.5 text-[11px] text-amber-200 shadow-lg">
               {notice}

@@ -63,6 +63,8 @@ import {
 } from './doc/serialize'
 import type { ProjectFile, SmartMaterialFile } from './doc/serialize'
 import { PRIMITIVES, buildPrimitive } from './mesh/primitives'
+import { loadGltfGeometry } from './mesh/gltf'
+import type { ImportedGltf } from './mesh/gltf'
 import { BUILT_IN_MATERIALS, DEFAULT_MATERIAL_ID } from './procedural/catalogue'
 import { describeCatalogue, getMaterialDef, instantiateMaterial, listMaterialDefs } from './procedural/material'
 import { defaultGeneratorParams, describeGenerators, getGeneratorDef, listGeneratorDefs } from './procedural/generators'
@@ -174,6 +176,11 @@ export class VibePainter {
       brushAlphas: [...BRUSH_ALPHAS],
       viewModes: [...VIEW_MODES],
       primitives: PRIMITIVES.map((p) => ({ id: p.id, name: p.name, description: p.description })),
+      meshImport: {
+        formats: ['.glb', '.gltf'],
+        method: 'importGltf',
+        notes: 'Replaces the current mesh. Scene graphs are flattened, centred and scaled to match the built-in primitives. Materials, animations and cameras are ignored.',
+      },
       environmentPresets: Object.keys(ENVIRONMENT_PRESETS),
       exportPresets: EXPORT_PRESETS.map((p) => ({
         id: p.id,
@@ -194,6 +201,20 @@ export class VibePainter {
   setMesh(primitiveId: string): void {
     const geometry = buildPrimitive(primitiveId)
     this.#installMesh(geometry, primitiveId, { kind: 'primitive', preset: primitiveId })
+  }
+
+  /**
+   * Replaces the painted mesh with the contents of a glTF / GLB file.
+   *
+   * Every triangle mesh in the file is merged into one geometry; skins are
+   * posed, instances are expanded, and the result is centred and scaled so
+   * the camera and brush still make sense. Materials and animations are
+   * ignored - this is a painter, not a scene viewer.
+   */
+  async importGltf(source: File | Blob | ArrayBuffer, fileName?: string): Promise<ImportedGltf> {
+    const imported = await loadGltfGeometry(source, fileName)
+    this.#installMesh(imported.geometry, imported.name, { kind: 'imported', fileName: imported.fileName })
+    return imported
   }
 
   /** Uses an externally loaded geometry. It must have UVs. */
@@ -646,6 +667,8 @@ export class VibePainter {
       project: this.engine.project.name,
       resolution: this.engine.resolution,
       hasRenderer: this.engine.renderer !== null,
+      meshName: this.engine.project.meshes[0]?.name ?? null,
+      meshSource: this.engine.project.meshes[0]?.source ?? null,
       meshTriangles: this.engine.project.meshes[0]?.triangleCount ?? 0,
       layers: this.engine.layerCount(),
       activeLayerId: this.engine.project.activeLayerId,
@@ -682,6 +705,7 @@ export type {
   FillLayerState,
   FolderLayerState,
   GeneratorType,
+  ImportedGltf,
   LayerState,
   PaintTargetKind,
   ProjectFile,

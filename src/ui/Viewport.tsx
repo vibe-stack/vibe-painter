@@ -128,12 +128,21 @@ function Stage({ api, tool, onPaintBlocked }: ViewportProps & { api: VibePainter
     instance.maxDistance = 20
     controls.current = instance
 
-    const radius = Math.max(0.5, api.engine.bounds().radius)
-    camera.position.set(radius * 1.1, radius * 0.9, radius * 2.2)
-    instance.target.set(0, 0, 0)
-    instance.update()
+    const frame = () => {
+      const radius = Math.max(0.5, api.engine.bounds().radius)
+      camera.position.set(radius * 1.1, radius * 0.9, radius * 2.2)
+      instance.target.set(0, 0, 0)
+      instance.minDistance = Math.max(0.05, radius * 0.08)
+      instance.maxDistance = Math.max(20, radius * 10)
+      instance.update()
+    }
+    frame()
+    const off = api.on('meshChanged', frame)
 
-    return () => instance.dispose()
+    return () => {
+      off()
+      instance.dispose()
+    }
   }, [api, camera, gl])
 
   const hitAt = useCallback(
