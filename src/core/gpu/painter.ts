@@ -37,6 +37,7 @@ import {
   If,
   Loop,
   dot,
+  int,
   float,
   length,
   max,
@@ -62,7 +63,7 @@ import { packBundle, unpackSlots } from './packing'
 import { CoverageTarget, SlotTargets } from './targets'
 import type { PaintBuffer } from './targets'
 import { vec4ArrayUniform } from './bindings'
-import { clearTarget, renderQuad } from './uvspace'
+import { clearTarget, compileAgainst, renderQuad } from './uvspace'
 import { Blitter } from './blit'
 import type { Dilator } from './dilate'
 
@@ -138,19 +139,28 @@ export class Painter {
   // Stamp batch uniforms.
   #stampPos = vec4ArrayUniform(MAX_STAMPS)
   #stampNrm = vec4ArrayUniform(MAX_STAMPS)
-  #stampCount = uniform(0)
+  #stampCount = uniform(0, 'int')
   #hardness = uniform(0.5)
   #flow = uniform(1)
   #facing = uniform(0.15)
   #alphaScale = uniform(1)
   #alphaContrast = uniform(0.5)
-  #alphaKind = uniform(0)
 
   // Commit uniforms.
   #strokeOpacity = uniform(1)
   #eraseMode = uniform(0)
 
-  #stampMaterial: MeshBasicNodeMaterial | null = null
+  /**
+   * One stamp pipeline per brush alpha, not one pipeline with the alpha on a
+   * uniform. Selecting between the five shapes with uniform weights meant
+   * every stamp evaluated *all* of them - a voronoi lattice plus three fbm
+   * stacks - for every texel of a 1024x1024 target, even for a plain round
+   * brush that needs none of it. That was ~1.3ms of GPU time per stamp, and a
+   * single dragged stroke lays down a hundred stamps. Recompiling when
+   * somebody picks a different brush shape is the cheaper trade by orders of
+   * magnitude.
+   */
+  #stampMaterials = new Map<BrushAlpha, MeshBasicNodeMaterial>()
   /**
    * Identity of the mesh maps the cached materials were built against.
    *
@@ -228,7 +238,6 @@ export class Painter {
     this.#facing.value = brush.facing
     this.#alphaScale.value = brush.alphaScale
     this.#alphaContrast.value = brush.alphaContrast
-    this.#alphaKind.value = BRUSH_ALPHAS.indexOf(brush.alpha)
     this.#strokeOpacity.value = brush.opacity
     this.#eraseMode.value = brush.erase ? 1 : 0
 
@@ -257,33 +266,28 @@ export class Painter {
     target: StrokeTarget,
     spec: BrushMaterialSpec,
     params: ParamBag,
+    alpha: BrushAlpha,
   ): Promise<void> {
     this.#syncMapsKey(maps)
     // Nothing to compile against until the geometry maps exist; the engine
     // calls this again once they do.
     if (!maps.geometryBaked) return
-    const key = `${this.#commitKey(spec, target)}|${geometry.id}`
+    const key = `${this.#commitKey(spec, target)}|${geometry.id}|${alpha}`
     if (this.#warmed.has(key)) return
     this.#warmed.add(key)
 
-    const previous = renderer.getRenderTarget()
     try {
       this.#quadScene.add(this.#quad)
-      this.#quad.material = this.#stampMaterialFor(maps)
-      renderer.setRenderTarget(this.#stroke.rt)
-      await renderer.compileAsync(this.#quadScene, this.#quad.camera)
+      this.#quad.material = this.#stampMaterialFor(maps, alpha)
+      await compileAgainst(renderer, this.#quadScene, this.#quad.camera, this.#stroke.rt)
 
       if (target.buffer.slots) {
-        this.#quadScene.add(this.#quad)
         this.#quad.material = this.#commitMaterial(target, spec, params, maps)
-        renderer.setRenderTarget(target.buffer.slots.rt)
-        await renderer.compileAsync(this.#quadScene, this.#quad.camera)
+        await compileAgainst(renderer, this.#quadScene, this.#quad.camera, target.buffer.slots.rt)
       }
 
-      this.#quadScene.add(this.#quad)
       this.#quad.material = this.#coverageCommitMaterial()
-      renderer.setRenderTarget(target.buffer.coverage.rt)
-      await renderer.compileAsync(this.#quadScene, this.#quad.camera)
+      await compileAgainst(renderer, this.#quadScene, this.#quad.camera, target.buffer.coverage.rt)
 
       // The baseline snapshot is a pass like any other and can be skipped while
       // its pipeline compiles - which would silently lose the existing paint.
@@ -298,7 +302,6 @@ export class Painter {
       }
     } finally {
       this.#quadScene.remove(this.#quad)
-      renderer.setRenderTarget(previous)
     }
   }
 
@@ -370,7 +373,7 @@ export class Painter {
         nrmValue.set(n[0], n[1], n[2], s.pressure ?? 1)
       }
       this.#stampCount.value = batch.length
-      renderQuad(renderer, this.#quad, this.#stampMaterialFor(maps), this.#stroke.rt)
+      renderQuad(renderer, this.#quad, this.#stampMaterialFor(maps, active.brush.alpha), this.#stroke.rt)
     }
     active.pending.length = 0
     active.painted = true
@@ -390,9 +393,10 @@ export class Painter {
    * It is also faster: one quad instead of every triangle of the mesh, per
    * stamp batch.
    */
-  #stampMaterialFor(maps: MeshMaps): MeshBasicNodeMaterial {
+  #stampMaterialFor(maps: MeshMaps, alpha: BrushAlpha): MeshBasicNodeMaterial {
     this.#syncMapsKey(maps)
-    if (this.#stampMaterial) return this.#stampMaterial
+    const cached = this.#stampMaterials.get(alpha)
+    if (cached) return cached
     const material = new MeshBasicNodeMaterial()
     material.depthTest = false
     material.depthWrite = false
@@ -419,24 +423,28 @@ export class Painter {
       const surfaceCoverage = surface.coverage.toVar('brushSurfaceCoverage')
 
       const coverage = float(0).toVar('brushCoverage')
-      Loop({ start: 0, end: MAX_STAMPS, type: 'int' }, ({ i }) => {
-        If(float(i).lessThan(this.#stampCount), () => {
-          const stamp = this.#stampPos.element(i)
-          const aux = this.#stampNrm.element(i)
-          const centre = stamp.xyz
-          const radius = max(stamp.w, float(1e-5))
-          const delta = surfacePosition.sub(centre)
-          const distance = length(delta)
+      // The loop runs to the batch's actual stamp count, not to `MAX_STAMPS`
+      // with a test inside. Same result, without paying for the empty slots.
+      Loop({ start: int(0), end: this.#stampCount, type: 'int' }, ({ i }) => {
+        const stamp = this.#stampPos.element(i)
+        const aux = this.#stampNrm.element(i)
+        const centre = stamp.xyz
+        const radius = max(stamp.w, float(1e-5))
+        const delta = surfacePosition.sub(centre)
+        const distance = length(delta)
 
-          // Radial falloff. Hardness moves the inner edge of the ramp outward.
-          // Forward edges only: WGSL leaves smoothstep indeterminate when
-          // low >= high, which silently broke the whole brush falloff.
-          const inner = radius.mul(this.#hardness.clamp(0, 0.99))
-          const radial = smoothstep(inner, radius, distance).oneMinus()
+        // Radial falloff. Hardness moves the inner edge of the ramp outward.
+        // Forward edges only: WGSL leaves smoothstep indeterminate when
+        // low >= high, which silently broke the whole brush falloff.
+        const inner = radius.mul(this.#hardness.clamp(0, 0.99))
+        const radial = smoothstep(inner, radius, distance).oneMinus()
 
+        // Almost every texel is outside almost every stamp, so reject on the
+        // cheap radial test before evaluating a shaped alpha's noise.
+        If(radial.greaterThan(float(0)), () => {
           // Local frame so shaped alphas orient with the surface, not the world.
           const local = vec2(dot(delta, surfaceTangent), dot(delta, surfaceBitangent)).div(radius)
-          const shaped = this.#alphaShape(local, radial)
+          const shaped = this.#alphaShape(local, radial, alpha)
 
           // Reject surfaces facing away from the stroke: this is what stops a
           // brush from bleeding through to the far side of a thin object.
@@ -456,33 +464,38 @@ export class Painter {
 
     const coverage = coverageFn()
     material.fragmentNode = vec4(coverage, coverage, coverage, coverage)
-    this.#stampMaterial = material
+    this.#stampMaterials.set(alpha, material)
     return material
   }
 
-  /** Procedural stamp alphas. No bitmap brushes anywhere in this app. */
-  #alphaShape(local: V2, radial: F): F {
+  /**
+   * Procedural stamp alphas. No bitmap brushes anywhere in this app.
+   *
+   * `alpha` is a plain string, not a node: only the shape actually selected is
+   * built into the graph. See `#stampMaterials`.
+   */
+  #alphaShape(local: V2, radial: F, alpha: BrushAlpha): F {
     const scale = max(this.#alphaScale, float(0.01))
     const contrast = this.#alphaContrast
-    const kind = this.#alphaKind
 
-    const round = radial
-    const square = smoothstep(this.#hardness.clamp(0, 0.99), float(1), max(local.x.abs(), local.y.abs())).oneMinus()
-    const speckleField = voronoi2(local.mul(scale.mul(6)), float(1)).x
-    const speckle = radial.mul(smoothstep(contrast.mul(0.6), contrast.mul(0.6).add(0.25), speckleField))
-    const splatterField = fbm01(vec3(local.mul(scale.mul(4)), 0), 4, 2.1, 0.55)
-    const splatter = radial.mul(smoothstep(contrast, contrast.add(0.15), splatterField))
-    const streakField = fbm01(vec3(local.x.mul(scale.mul(30)), local.y.mul(scale.mul(1.5)), 0), 3, 2, 0.5)
-    const streaks = radial.mul(smoothstep(contrast.mul(0.8), contrast.mul(0.8).add(0.2), streakField))
-
-    // Selected by a uniform, so switching alpha never recompiles.
-    const pick = (index: number): F => float(1).sub(kind.sub(index).abs().clamp(0, 1))
-    return round
-      .mul(pick(0))
-      .add(square.mul(pick(1)))
-      .add(speckle.mul(pick(2)))
-      .add(splatter.mul(pick(3)))
-      .add(streaks.mul(pick(4)))
+    switch (alpha) {
+      case 'square':
+        return smoothstep(this.#hardness.clamp(0, 0.99), float(1), max(local.x.abs(), local.y.abs())).oneMinus()
+      case 'speckle': {
+        const field = voronoi2(local.mul(scale.mul(6)), float(1)).x
+        return radial.mul(smoothstep(contrast.mul(0.6), contrast.mul(0.6).add(0.25), field))
+      }
+      case 'splatter': {
+        const field = fbm01(vec3(local.mul(scale.mul(4)), 0), 4, 2.1, 0.55)
+        return radial.mul(smoothstep(contrast, contrast.add(0.15), field))
+      }
+      case 'streaks': {
+        const field = fbm01(vec3(local.x.mul(scale.mul(30)), local.y.mul(scale.mul(1.5)), 0), 3, 2, 0.5)
+        return radial.mul(smoothstep(contrast.mul(0.8), contrast.mul(0.8).add(0.2), field))
+      }
+      default:
+        return radial
+    }
   }
 
   /**
@@ -505,8 +518,8 @@ export class Painter {
     const key = `${maps.geometryBaked ? 1 : 0}:${maps.rayBaked ? 1 : 0}:${maps.geometry.textures.map((t) => t.id).join(',')}`
     if (key === this.#mapsKey) return
     this.#mapsKey = key
-    this.#stampMaterial?.dispose()
-    this.#stampMaterial = null
+    for (const material of this.#stampMaterials.values()) material.dispose()
+    this.#stampMaterials.clear()
     for (const material of this.#commitMaterials.values()) material.dispose()
     this.#commitMaterials.clear()
     this.#warmed.clear()
@@ -605,7 +618,8 @@ export class Painter {
     this.#stroke.dispose()
     this.#baselineSlots.dispose()
     this.#baselineCoverage.dispose()
-    this.#stampMaterial?.dispose()
+    for (const material of this.#stampMaterials.values()) material.dispose()
+    this.#stampMaterials.clear()
     for (const material of this.#commitMaterials.values()) material.dispose()
     this.#commitMaterials.clear()
   }

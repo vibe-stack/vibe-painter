@@ -13,7 +13,7 @@
 import { MeshBasicNodeMaterial, NoBlending, QuadMesh, Scene } from 'three/webgpu'
 import type { Renderer, RenderTarget, Texture } from 'three/webgpu'
 import { mrt, texture, uv, vec4 } from 'three/tsl'
-import { renderQuad } from './uvspace'
+import { compileAgainst, renderQuad } from './uvspace'
 
 export class Blitter {
   #quad = new QuadMesh()
@@ -60,23 +60,20 @@ export class Blitter {
   /**
    * Precompiles a blit's pipeline so the first use is not silently skipped.
    *
-   * The destination stays bound across `compileAsync`, because MRT outputs are
-   * matched to attachments by texture name: compile against the canvas instead
-   * and every output is dropped, producing an empty output struct and a WGSL
-   * error rather than a working pipeline. The quad has to be *in* the scene
-   * being compiled, too - compiling an empty scene succeeds and warms nothing.
+   * `compileAgainst` handles binding the destination - MRT outputs are matched
+   * to attachments by texture name, so compiling against the canvas drops every
+   * output and produces a WGSL error rather than a working pipeline. The quad
+   * has to be *in* the scene being compiled, too: compiling an empty scene
+   * succeeds and warms nothing.
    */
   async prewarm(renderer: Renderer, sources: readonly Texture[], destination: RenderTarget, names: readonly string[]): Promise<void> {
     if (sources.length === 0) return
-    const previous = renderer.getRenderTarget()
     this.#quad.material = this.#materialFor(sources, names)
     this.#scene.add(this.#quad)
-    renderer.setRenderTarget(destination)
     try {
-      await renderer.compileAsync(this.#scene, this.#quad.camera)
+      await compileAgainst(renderer, this.#scene, this.#quad.camera, destination)
     } finally {
       this.#scene.remove(this.#quad)
-      renderer.setRenderTarget(previous)
     }
     this.blit(renderer, sources, destination, names)
   }

@@ -13,7 +13,7 @@
  */
 
 import { OrthographicCamera, Scene, Mesh, DoubleSide } from 'three/webgpu'
-import type { BufferGeometry, Material, QuadMesh, Renderer, RenderTarget } from 'three/webgpu'
+import type { BufferGeometry, Camera, Material, QuadMesh, Renderer, RenderTarget } from 'three/webgpu'
 import { cameraProjectionMatrix, float, uv, vec4 } from 'three/tsl'
 import type { V2, V4 } from './nodes'
 
@@ -111,6 +111,43 @@ export function renderQuad(
     renderer.autoClear = previousAutoClear
     renderer.setRenderTarget(previousTarget)
   }
+}
+
+/**
+ * Compiles `scene` as it would be drawn into `target`, without leaving that
+ * target bound while we wait.
+ *
+ * The binding matters: pipelines depend on the attachment formats, and MRT
+ * outputs are matched to attachments by texture name, so compiling against the
+ * canvas produces a different pipeline than the one the pass will use - or no
+ * pipeline at all.
+ *
+ * But `await`ing with a render target bound is a live grenade. The await hands
+ * control back to the event loop, the animation frame fires, and the frame
+ * renders the whole scene into whichever target happened to be bound - here, a
+ * paint buffer. It shows up as a layer that starts life with random coverage
+ * across every texel, at full opacity, non-deterministically: the "paint is
+ * only half applied" that no amount of staring at the brush maths explains.
+ *
+ * `compileAsync` reads the bound target synchronously, before its first await,
+ * so starting it and restoring the target before awaiting the promise is both
+ * correct and the only version that is safe.
+ */
+export async function compileAgainst(
+  renderer: Renderer,
+  scene: Scene,
+  camera: Camera,
+  target: RenderTarget,
+): Promise<void> {
+  const previous = renderer.getRenderTarget()
+  renderer.setRenderTarget(target)
+  let pending: Promise<unknown>
+  try {
+    pending = renderer.compileAsync(scene, camera)
+  } finally {
+    renderer.setRenderTarget(previous)
+  }
+  await pending
 }
 
 /** Clears a render target without drawing anything into it. */

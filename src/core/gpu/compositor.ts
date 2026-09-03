@@ -59,6 +59,26 @@ export class Compositor {
   /** Extra draws after a shader rebuild. WebGPU skips the first draw of a new pipeline. */
   #rebuildDraws = 0
 
+  /**
+   * Stroke fast path: everything below the layer being painted, frozen.
+   *
+   * A stroke recomposites the stack on every pointer sample, and the stack is
+   * procedural - a base layer with a real material costs ~90ms of GPU time per
+   * evaluation, so painting on top of one ran at a handful of frames a second
+   * no matter how cheap the brush itself was. Nothing under the painted layer
+   * can change while the pointer is down, though, so it is rendered once at
+   * stroke start and read back as a texture for the rest of the stroke.
+   *
+   * The split is by top-level layer. `#evalStack` composites bottom-up and a
+   * folder receives the same `dst` its siblings would, so resuming from a
+   * snapshot of the layers below is exact, give or take the half-float
+   * rounding the output target applies anyway.
+   */
+  #below: SlotTargets | null = null
+  #belowMaterial: MeshBasicNodeMaterial | null = null
+  #strokeLayerId: string | null = null
+  #belowValid = false
+
   constructor(resolution: number) {
     this.output = new SlotTargets(resolution, 'composite')
   }
@@ -70,8 +90,10 @@ export class Compositor {
   setResolution(resolution: number): void {
     if (resolution === this.output.resolution) return
     this.output.setSize(resolution)
+    this.#below?.setSize(resolution)
     this.#needsRebuild = true
     this.#needsComposite = true
+    this.#belowValid = false
   }
 
   /** Marks the composite stale without touching the graph. */
@@ -79,10 +101,27 @@ export class Compositor {
     this.#needsComposite = true
   }
 
+  /**
+   * Splits the graph below `layerId`, so painting that layer does not
+   * re-evaluate what is under it. Safe to call with a layer that turns out not
+   * to be splittable - the graph just stays whole.
+   *
+   * The split is not undone when the stroke ends. It costs a shader rebuild to
+   * put in place and produces the same pixels either way, so tearing it down
+   * would mean rebuilding twice per stroke for no gain; `sync()` already
+   * invalidates the frozen half whenever the document changes.
+   */
+  splitBelow(layerId: string): void {
+    if (this.#strokeLayerId === layerId) return
+    this.#strokeLayerId = layerId
+    this.invalidateGraph()
+  }
+
   /** Forces a shader rebuild, e.g. after mesh maps are (re)bound. */
   invalidateGraph(): void {
     this.#needsRebuild = true
     this.#needsComposite = true
+    this.#belowValid = false
   }
 
   get dirty(): boolean {
@@ -112,6 +151,8 @@ export class Compositor {
       this.#needsRebuild = true
     }
     this.#needsComposite = true
+    // Any document edit can change what is under the stroke.
+    this.#belowValid = false
   }
 
   /** Composites, if anything changed since the last call. */
@@ -125,6 +166,14 @@ export class Compositor {
     }
     if (!this.#needsComposite && this.#rebuildDraws === 0) return false
 
+    // The frozen lower stack is re-rendered while the pipeline is still
+    // warming, because a skipped draw would leave the cache holding whatever
+    // was in that memory.
+    if (this.#belowMaterial && this.#below && (!this.#belowValid || this.#rebuildDraws > 0)) {
+      renderQuad(renderer, this.#quad, this.#belowMaterial, this.#below.rt)
+      this.#belowValid = true
+    }
+
     renderQuad(renderer, this.#quad, this.#material!, this.output.rt)
     this.#needsComposite = false
     if (this.#rebuildDraws > 0) {
@@ -136,6 +185,8 @@ export class Compositor {
 
   #rebuild(set: TextureSetState, maps: MeshMaps, buffers: Map<string, PaintBuffer>): void {
     this.#material?.dispose()
+    this.#belowMaterial?.dispose()
+    this.#belowMaterial = null
     const material = new MeshBasicNodeMaterial()
     material.depthTest = false
     material.depthWrite = false
@@ -150,7 +201,26 @@ export class Compositor {
       buffers,
     }
 
-    const result = this.#evalStack(set.layers, defaultBundle(), ctx)
+    // Split the stack if a stroke is running on anything but the bottom layer.
+    const split = this.#strokeLayerId === null
+      ? -1
+      : set.layers.findIndex((layer) => containsLayer(layer, this.#strokeLayerId!))
+    let base = defaultBundle()
+    let layers = set.layers
+    if (split > 0) {
+      const below = this.#ensureBelow(set.resolution)
+      const belowMaterial = new MeshBasicNodeMaterial()
+      belowMaterial.depthTest = false
+      belowMaterial.depthWrite = false
+      belowMaterial.blending = NoBlending
+      const frozen = this.#evalStack(set.layers.slice(0, split), defaultBundle(), ctx)
+      belowMaterial.fragmentNode = mrt(packBundle({ ...frozen, normal: normalize(frozen.normal) }))
+      this.#belowMaterial = belowMaterial
+      base = unpackSlots(below.rt.textures, uvNode)
+      layers = set.layers.slice(split)
+    }
+
+    const result = this.#evalStack(layers, base, ctx)
     // Normals must leave the compositor unit length: layers blend them with
     // RNM and with plain lerps, and neither preserves magnitude.
     const normalised: ChannelBundle = { ...result, normal: normalize(result.normal) }
@@ -243,8 +313,18 @@ export class Compositor {
     return value.clamp(0, 1)
   }
 
+  #ensureBelow(resolution: number): SlotTargets {
+    if (this.#below && this.#below.resolution === resolution) return this.#below
+    this.#below?.dispose()
+    this.#below = new SlotTargets(resolution, 'compositeBelow')
+    this.#belowValid = false
+    return this.#below
+  }
+
   dispose(): void {
     this.#material?.dispose()
+    this.#belowMaterial?.dispose()
+    this.#below?.dispose()
     this.output.dispose()
   }
 }
@@ -253,6 +333,12 @@ export class Compositor {
 
 function coverageOf(buffer: PaintBuffer, ctx: BuildContext): F {
   return blurredCoverage(buffer.coverage.texture, ctx.uv, null)
+}
+
+/** Whether `id` is `layer` or lives anywhere inside it. */
+function containsLayer(layer: LayerState, id: string): boolean {
+  if (layer.id === id) return true
+  return layer.kind === 'folder' && layer.children.some((child) => containsLayer(child, id))
 }
 
 function axisIndex(axis: 'x' | 'y' | 'z'): 0 | 1 | 2 {

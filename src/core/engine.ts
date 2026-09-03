@@ -471,8 +471,12 @@ export class Engine {
   }
 
   setBrush(patch: Partial<BrushSettings>): void {
+    const previousAlpha = this.#brush.alpha
     this.#brush = { ...this.#brush, ...patch }
     this.#cursor.setBrush(this.#brush.radius, this.#brush.hardness, this.#brush.erase)
+    // Each brush shape is its own stamp pipeline, so a new one has to be
+    // compiled before the stroke that needs it rather than during it.
+    if (this.#brush.alpha !== previousAlpha) this.prewarmPainting()
     this.#notify('brush')
   }
 
@@ -552,7 +556,7 @@ export class Engine {
         defId: this.#brushMaterial.defId,
         params: this.#brushMaterial.params,
         projection: this.#brushProjection,
-      }, this.#brushParams)
+      }, this.#brushParams, this.#brush.alpha)
       .catch((cause) => this.events.emit('error', { message: 'Could not prepare the brush', cause }))
   }
 
@@ -562,6 +566,10 @@ export class Engine {
     const target = this.#resolveStrokeTarget()
     if (!renderer || !geometry || !target) return false
 
+    // Freeze everything under the layer being painted for the stroke's
+    // duration, so each pointer sample does not re-evaluate the whole
+    // procedural stack. See `Compositor#below`.
+    if (this.activeLayer && !(globalThis as unknown as { __nosplit?: boolean }).__nosplit) this.#compositor.splitBelow(this.activeLayer.id)
     this.#painter.begin(renderer, target, this.#brush, {
       defId: this.#brushMaterial.defId,
       params: this.#brushMaterial.params,
@@ -578,6 +586,85 @@ export class Engine {
     if (!renderer || !geometry || !this.#painter.isStroking) return
     this.#painter.move(renderer, this.#meshMaps, sample)
     this.#compositeNow()
+  }
+
+  /** TEMP DEBUG */
+  async debugProbe(): Promise<unknown> {
+    const renderer = this.#renderer
+    const buffer = [...this.#paintBuffers.values()][0]
+    if (!renderer || !buffer) return { error: 'no buffer' }
+    const res = buffer.resolution
+    const half = (h: number): number => {
+      const sg = (h & 0x8000) ? -1 : 1
+      const e = (h >> 10) & 0x1f
+      const f = h & 0x3ff
+      if (e === 0) return sg * Math.pow(2, -14) * (f / 1024)
+      if (e === 31) return f ? NaN : sg * Infinity
+      return sg * Math.pow(2, e - 15) * (1 + f / 1024)
+    }
+    const toF = (raw: ArrayLike<number>): Float32Array => {
+      if (raw instanceof Float32Array) return raw
+      const out = new Float32Array(raw.length)
+      for (let i = 0; i < raw.length; i++) out[i] = half(raw[i])
+      return out
+    }
+    const cov = toF(await renderer.readRenderTargetPixelsAsync(buffer.coverage.rt, 0, 0, res, res, 0) as unknown as ArrayLike<number>)
+    const paint = toF(await renderer.readRenderTargetPixelsAsync(buffer.slots!.rt, 0, 0, res, res, 0) as unknown as ArrayLike<number>)
+    const out = this.#compositor.output
+    const comp = toF(await renderer.readRenderTargetPixelsAsync(out.rt, 0, 0, out.resolution, out.resolution, 0) as unknown as ArrayLike<number>)
+    let maxCov = 0, argmax = 0
+    for (let i = 0; i < res * res; i++) if (cov[i] > maxCov) { maxCov = cov[i]; argmax = i }
+    const at = (i: number) => ({
+      coverage: +cov[i].toFixed(4),
+      paint: [paint[i * 4], paint[i * 4 + 1], paint[i * 4 + 2]].map((v) => +v.toFixed(4)),
+      composite: [comp[i * 4], comp[i * 4 + 1], comp[i * 4 + 2]].map((v) => +v.toFixed(4)),
+    })
+    const bins = new Array(11).fill(0)
+    for (let i = 0; i < res * res; i++) {
+      const c = cov[i]
+      if (c > 0.0005) bins[Math.min(10, Math.round(c * 10))]++
+    }
+    // 32x32 downsample of coverage, as digits, so the shape is visible in a log.
+    const N = 32, cell = res / N
+    const grid: string[] = []
+    for (let gy = 0; gy < N; gy++) {
+      let line = ''
+      for (let gx = 0; gx < N; gx++) {
+        let sum = 0
+        for (let y = 0; y < cell; y += 4) for (let x = 0; x < cell; x += 4) {
+          sum += cov[(gy * cell + y) * res + (gx * cell + x)]
+        }
+        const avg = sum / ((cell / 4) * (cell / 4))
+        line += avg < 0.005 ? '.' : String(Math.min(9, Math.round(avg * 9)))
+      }
+      grid.push(line)
+    }
+    const out2 = this.#compositor.output
+    let checksum = 0
+    for (let sl = 0; sl < 4; sl++) {
+      const d = toF(await renderer.readRenderTargetPixelsAsync(out2.rt, 0, 0, out2.resolution, out2.resolution, sl) as unknown as ArrayLike<number>)
+      for (let i = 0; i < d.length; i += 97) checksum = (checksum + Math.round(d[i] * 4096)) % 2147483647
+    }
+    return { maxCov: +maxCov.toFixed(4), atMax: at(argmax), bins, grid, checksum }
+  }
+
+  /** TEMP DEBUG */
+  async debugReclear(): Promise<unknown> {
+    const renderer = this.#renderer
+    const buffer = [...this.#paintBuffers.values()][0]
+    if (!renderer || !buffer) return { error: 'no buffer' }
+    clearTarget(renderer, buffer.coverage.rt)
+    const res = buffer.resolution
+    const raw = await renderer.readRenderTargetPixelsAsync(buffer.coverage.rt, 0, 0, res, res, 0) as unknown as ArrayLike<number>
+    const half = (h: number): number => {
+      const e = (h >> 10) & 0x1f, f = h & 0x3ff
+      if (e === 0) return Math.pow(2, -14) * (f / 1024)
+      if (e === 31) return NaN
+      return Math.pow(2, e - 15) * (1 + f / 1024)
+    }
+    let mx = 0
+    for (let i = 0; i < res * res; i++) { const v = raw instanceof Float32Array ? raw[i] : half(raw[i]); if (v > mx) mx = v }
+    return { maxAfterReclear: +mx.toFixed(4) }
   }
 
   endStroke(): void {
