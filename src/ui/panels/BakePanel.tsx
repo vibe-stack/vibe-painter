@@ -41,8 +41,9 @@ export function BakePanel() {
   return (
     <Panel title="Bake Mesh Maps">
       <p className="px-3 py-2 text-[10px] leading-relaxed text-neutral-500">
-        Traces ambient occlusion, curvature and thickness into UV space. Runs on worker threads, so the viewport stays
-        live. Geometry maps (position, normal, tangent) are baked on the GPU automatically whenever the mesh changes.
+        Bakes ambient occlusion, curvature and thickness in the same UV-space GPU pass as the geometry maps, so they
+        cannot disagree about which texel is surface. Geometry maps (position, normal, tangent) update automatically
+        whenever the mesh changes; these three still need an explicit bake.
       </p>
 
       <div className="px-3">
@@ -53,7 +54,7 @@ export function BakePanel() {
 
       <SectionHeading>Settings</SectionHeading>
       <Slider label="Resolution" hint="Mesh maps are low frequency, so they are usually fine at half the texture resolution." value={settings.resolution} min={128} max={2048} step={128} onChange={(resolution) => patch({ resolution: Math.round(resolution) })} />
-      <Slider label="AO Rays" hint="More rays means less noise and a longer bake. Stratified sampling makes 32 go a long way." value={settings.aoRays} min={8} max={256} step={1} onChange={(aoRays) => patch({ aoRays: Math.round(aoRays) })} />
+      <Slider label="AO Directions" hint="Visibility is accumulated from this many directions around the mesh. More is smoother." value={settings.aoRays} min={8} max={64} step={1} onChange={(aoRays) => patch({ aoRays: Math.round(aoRays) })} />
       <Slider label="AO Distance" hint="Fraction of the model size a ray may travel before it counts as unoccluded." value={settings.aoDistance} min={0.02} max={2} step={0.01} onChange={(aoDistance) => patch({ aoDistance })} />
       <Slider label="Thickness Rays" value={settings.thicknessRays} min={0} max={128} step={1} onChange={(thicknessRays) => patch({ thicknessRays: Math.round(thicknessRays) })} />
       <Slider label="Curvature Contrast" hint="Curvature is normalised against the mesh\u2019s own average, so this is contrast rather than an absolute scale." value={settings.curvatureIntensity} min={0.05} max={6} step={0.01} onChange={(curvatureIntensity) => patch({ curvatureIntensity })} />

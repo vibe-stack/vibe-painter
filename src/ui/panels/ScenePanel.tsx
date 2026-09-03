@@ -42,7 +42,7 @@ export function ScenePanel() {
       const imported = await api.importGltf(file)
       setImportNote(
         imported.generatedUVs
-          ? 'This file had no UVs, so a box atlas was generated. UV painting will overlap; triplanar projection is the safer mode.'
+          ? 'UVs were missing or overlapping, so a unique unwrap was generated. Rebake mesh maps after import.'
           : null,
       )
     } catch (cause) {

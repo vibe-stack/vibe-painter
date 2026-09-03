@@ -35,8 +35,8 @@ import { BrushCursor } from './gpu/cursor'
 import { ProceduralEnvironment, ENVIRONMENT_PRESETS } from './gpu/environment'
 import { LightRig } from './gpu/lighting'
 import type { EnvironmentSettings } from './gpu/environment'
-import { RayBaker } from './bake/baker'
 import type { BakeProgress } from './bake/baker'
+import { GpuMeshMapBaker } from './gpu/meshmapbake'
 import { prepareGeometry } from './mesh/tangents'
 import { ParamBag } from './procedural/params'
 import { getMaterialDef, instantiateMaterial } from './procedural/material'
@@ -80,7 +80,7 @@ export class Engine {
   #meshMaps: MeshMaps
   #dilator = new Dilator()
   #geometryBaker = new GeometryBaker()
-  #rayBaker = new RayBaker()
+  #meshMapBaker = new GpuMeshMapBaker()
   #environment = new ProceduralEnvironment()
   #lights = new LightRig()
   #cursor = new BrushCursor()
@@ -433,26 +433,28 @@ export class Engine {
   }
 
   async bakeMeshMaps(settings: Partial<BakeSettings> = {}): Promise<void> {
+    const renderer = this.#renderer
     const geometry = this.geometry
     const set = this.activeTextureSet
+    if (!renderer) throw new Error('Bake needs a renderer; call attachRenderer first')
     if (!geometry || !set) throw new Error('Nothing to bake: load a mesh first')
     if (this.#baking) throw new Error('A bake is already running')
 
     const merged: BakeSettings = { ...DEFAULT_BAKE_SETTINGS, ...(set.meshMaps?.settings ?? {}), ...settings }
     this.#baking = true
     try {
-      const maps = await this.#rayBaker.bake(geometry, merged, (progress) => {
+      if (!this.#meshMaps.geometryBaked) this.#bakeGeometry({ silent: true })
+      this.#meshMapBaker.bake(renderer, geometry, this.#meshMaps, merged, (progress) => {
         this.events.emit('bakeProgress', progress)
       })
-      this.#meshMaps.setRayMaps(maps)
+      this.#dilator.dilateRay(renderer, this.#meshMaps, merged.dilation)
+      this.events.emit('bakeProgress', { fraction: 1, message: 'Done' })
       set.meshMaps = {
         resolution: merged.resolution,
         available: ['ao', 'curvature', 'thickness'],
         settings: merged,
         bakedAt: Date.now(),
       }
-      // A new DataTexture means the graphs referencing the old one are stale -
-      // and the old one is disposed, so the live shader cannot draw again.
       this.#compositor.invalidateGraph({ immediate: true })
       this.#needsViewportRebuild = true
       this.events.emit('bakeComplete', { kind: 'rays' })
@@ -463,7 +465,7 @@ export class Engine {
   }
 
   cancelBake(): void {
-    this.#rayBaker.cancel()
+    this.#meshMapBaker.cancel()
     this.#baking = false
   }
 
@@ -761,6 +763,7 @@ export class Engine {
     this.#painter.dispose()
     this.#dilator.dispose()
     this.#geometryBaker.dispose()
+    this.#meshMapBaker.dispose()
     this.#meshMaps.dispose()
     this.#environment.dispose()
     this.#lights.dispose()
@@ -768,7 +771,6 @@ export class Engine {
     this.#viewport.dispose()
     for (const buffer of this.#paintBuffers.values()) buffer.dispose()
     this.#paintBuffers.clear()
-    this.#rayBaker.cancel()
     this.events.clear()
   }
 }

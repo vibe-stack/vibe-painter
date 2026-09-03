@@ -18,7 +18,7 @@ import type { Renderer, Texture } from 'three/webgpu'
 import { QuadMesh } from 'three/webgpu'
 import { mrt, uv } from 'three/tsl'
 import type { F, V2, V4 } from './nodes'
-import { GEOMETRY_MAP_NAMES } from './meshmaps'
+import { GEOMETRY_MAP_NAMES, RAY_MAP_NAME, createRayTarget } from './meshmaps'
 import type { MeshMaps } from './meshmaps'
 import { SLOT_COUNT, SLOT_NAMES } from '../channels'
 import type { PaintBuffer } from '../gpu/targets'
@@ -114,6 +114,8 @@ export class Dilator {
   #slotScratch: SlotTargets | null = null
   #coverageMaterial: MeshBasicNodeMaterial | null = null
   #coverageScratch: RenderTarget | null = null
+  #rayMaterial: MeshBasicNodeMaterial | null = null
+  #rayScratch: RenderTarget | null = null
   #sourceKey = ''
   #blitter = new Blitter()
 
@@ -143,6 +145,36 @@ export class Dilator {
       // texels the dilation shader read, and a render pass shares its UV
       // convention with every other pass by construction.
       this.#blitter.blit(renderer, scratch.textures, maps.geometry, GEOMETRY_MAP_NAMES)
+    }
+  }
+
+  /** Grows AO / curvature / thickness into the UV gutter. */
+  dilateRay(renderer: Renderer, maps: MeshMaps, iterations: number): void {
+    if (iterations <= 0 || !maps.rayBaked) return
+    const res = maps.ray.width
+    this.#texelSize.value.set(1 / res, 1 / res)
+    const scratch = this.#ensureRayScratch(res)
+    const key = `ray:${maps.ray.texture.id}:${maps.islandMask.texture.id}`
+    if (!this.#rayMaterial || this.#sourceKey !== key) {
+      this.#rayMaterial?.dispose()
+      const material = new MeshBasicNodeMaterial()
+      material.depthTest = false
+      material.depthWrite = false
+      material.blending = NoBlending
+      const { outputs } = dilateNode(
+        [maps.ray.texture],
+        maps.ray.texture,
+        'w',
+        this.#texelSize,
+        maps.islandMask.texture,
+      )
+      material.fragmentNode = outputs[0]
+      this.#rayMaterial = material
+      this.#sourceKey = key
+    }
+    for (let i = 0; i < iterations; i++) {
+      renderQuad(renderer, this.#quad, this.#rayMaterial, scratch)
+      this.#blitter.blit(renderer, [scratch.texture], maps.ray, [RAY_MAP_NAME])
     }
   }
 
@@ -188,6 +220,13 @@ export class Dilator {
     })
     this.#geometryScratch = rt
     return rt
+  }
+
+  #ensureRayScratch(res: number): RenderTarget {
+    if (this.#rayScratch && this.#rayScratch.width === res) return this.#rayScratch
+    this.#rayScratch?.dispose()
+    this.#rayScratch = createRayTarget(res, 'dilateRay')
+    return this.#rayScratch
   }
 
   #ensureSlotScratch(res: number): SlotTargets {
@@ -244,6 +283,8 @@ export class Dilator {
     this.#slotScratch?.dispose()
     this.#coverageMaterial?.dispose()
     this.#coverageScratch?.dispose()
+    this.#rayMaterial?.dispose()
+    this.#rayScratch?.dispose()
     this.#blitter.dispose()
   }
 }

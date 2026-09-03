@@ -8,8 +8,8 @@
  *  - The *geometry* maps (position, normal, tangent, island coverage) are a
  *    single GPU pass that rasterises the mesh into its own UV layout. They are
  *    effectively free and are rebuilt whenever the mesh changes.
- *  - The *ray* maps (AO, curvature, thickness) need a BVH traversal per texel.
- *    Those are baked on the CPU in a worker, at a lower resolution, on demand.
+ *  - The *ray* maps (AO, curvature, thickness) are a fullscreen gather over
+ *    those geometry maps, so they share the same UV convention and coverage.
  *
  * Everything downstream reads them through `MeshMapNodes`, which supplies
  * neutral constants for anything not baked yet - so every graph still compiles
@@ -17,11 +17,6 @@
  */
 
 import {
-  ClampToEdgeWrapping,
-  DataTexture,
-  FloatType,
-  LinearFilter,
-  NoColorSpace,
   RGBAFormat,
   RedFormat,
   RenderTarget,
@@ -32,14 +27,21 @@ import type { Texture } from 'three/webgpu'
 import { cross, float, length, texture, uniform, vec3 } from 'three/tsl'
 import type { MeshMapNodes } from '../procedural/material'
 import type { V2, V3 } from './nodes'
-
 export const GEOMETRY_MAP_NAMES = ['geomPosition', 'geomNormal', 'geomTangent'] as const
 
-/** Ray-baked maps, packed into one RGBA texture. */
+/** @deprecated CPU baker payload; GPU bake writes a render target instead. */
 export interface RayMapData {
   resolution: number
   /** r = ao, g = curvature, b = thickness, a = coverage. */
   data: Float32Array
+}
+
+export const RAY_MAP_NAME = 'rayMaps'
+
+export function createRayTarget(resolution: number, name = RAY_MAP_NAME): RenderTarget {
+  const rt = new RenderTarget(resolution, resolution, { ...CHANNEL_TARGET_OPTIONS, format: RGBAFormat })
+  rt.texture.name = name
+  return rt
 }
 
 export class MeshMaps {
@@ -56,10 +58,11 @@ export class MeshMaps {
   readonly islandMask: RenderTarget
   resolution: number
 
-  #rayTexture: DataTexture | null = null
+  #ray: RenderTarget
   #bboxMin = uniform(new Vector3(0, 0, 0))
   #bboxSize = uniform(new Vector3(1, 1, 1))
   #geometryBaked = false
+  #rayBaked = false
 
   constructor(resolution: number) {
     this.resolution = resolution
@@ -73,6 +76,17 @@ export class MeshMaps {
     })
     this.islandMask = new RenderTarget(resolution, resolution, { ...CHANNEL_TARGET_OPTIONS, format: RedFormat })
     this.islandMask.texture.name = 'islandMask'
+    this.#ray = createRayTarget(resolution)
+  }
+
+  get ray(): RenderTarget {
+    return this.#ray
+  }
+
+  get bbox(): { min: Vector3; max: Vector3 } {
+    const min = this.#bboxMin.value.clone()
+    const max = min.clone().add(this.#bboxSize.value)
+    return { min, max }
   }
 
   get geometryBaked(): boolean {
@@ -80,7 +94,7 @@ export class MeshMaps {
   }
 
   get rayBaked(): boolean {
-    return this.#rayTexture !== null
+    return this.#rayBaked
   }
 
   markGeometryBaked(bboxMin: Vector3, bboxMax: Vector3): void {
@@ -94,31 +108,27 @@ export class MeshMaps {
     )
   }
 
-  setRayMaps(maps: RayMapData): void {
-    this.#rayTexture?.dispose()
-    const tex = new DataTexture(maps.data, maps.resolution, maps.resolution, RGBAFormat, FloatType)
-    tex.name = 'rayMaps'
-    tex.minFilter = LinearFilter
-    tex.magFilter = LinearFilter
-    tex.wrapS = ClampToEdgeWrapping
-    tex.wrapT = ClampToEdgeWrapping
-    tex.generateMipmaps = false
-    tex.colorSpace = NoColorSpace
-    tex.needsUpdate = true
-    this.#rayTexture = tex
+  ensureRayTarget(resolution: number): void {
+    if (this.#ray.width === resolution) return
+    this.#ray.dispose()
+    this.#ray = createRayTarget(resolution)
+    this.#rayBaked = false
+  }
+
+  markRayBaked(): void {
+    this.#rayBaked = true
   }
 
   clearRayMaps(): void {
-    this.#rayTexture?.dispose()
-    this.#rayTexture = null
+    this.#rayBaked = false
   }
 
   geometryTexture(index: number): Texture {
     return this.geometry.textures[index]
   }
 
-  get rayTexture(): DataTexture | null {
-    return this.#rayTexture
+  get rayTexture(): Texture | null {
+    return this.#rayBaked ? this.#ray.texture : null
   }
 
   setSize(resolution: number): void {
@@ -126,8 +136,10 @@ export class MeshMaps {
     this.resolution = resolution
     this.geometry.setSize(resolution, resolution)
     this.islandMask.setSize(resolution, resolution)
+    this.ensureRayTarget(resolution)
     // The geometry maps no longer describe anything until they are re-rendered.
     this.#geometryBaked = false
+    this.#rayBaked = false
   }
 
   /**
@@ -168,7 +180,7 @@ export class MeshMaps {
     const orthoTangent = safeNormalize(projected, perpendicularTo(normal))
     const bitangent = cross(normal, orthoTangent).mul(handedness)
 
-    const ray = this.#rayTexture ? texture(this.#rayTexture, uvNode) : null
+    const ray = this.#rayBaked ? texture(this.#ray.texture, uvNode) : null
 
     return {
       position,
@@ -188,8 +200,8 @@ export class MeshMaps {
   dispose(): void {
     this.geometry.dispose()
     this.islandMask.dispose()
-    this.#rayTexture?.dispose()
-    this.#rayTexture = null
+    this.#ray.dispose()
+    this.#rayBaked = false
   }
 }
 

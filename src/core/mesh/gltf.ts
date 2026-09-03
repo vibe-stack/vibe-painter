@@ -14,28 +14,27 @@
  * working without a second set of units.
  */
 
-import { Box3, BufferAttribute, BufferGeometry, DataTexture, Matrix4, Vector3 } from 'three/webgpu'
+import { BufferAttribute, BufferGeometry, DataTexture, Matrix4, Vector3 } from 'three/webgpu'
 import type { InstancedMesh, Material, Mesh, Object3D, SkinnedMesh, Texture } from 'three/webgpu'
 import { DRACO_GLTF_CONFIG, DRACOLoader } from 'three/addons/loaders/DRACOLoader.js'
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js'
-import { deinterleaveGeometry, mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js'
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js'
+import { compactGeometryAttributes } from './attributes'
 import { prepareGeometry } from './tangents'
+import { uniqueUnwrap, uvsOverlap } from './unwrap'
 
 export interface ImportedGltf {
   geometry: BufferGeometry
   name: string
   fileName: string
   triangleCount: number
-  /** True when the file had no UVs and we generated a box atlas. */
+  /** True when we generated or replaced UVs so the baker has a unique atlas. */
   generatedUVs: boolean
 }
 
 /** Longest-axis length matching the built-in primitives (cube is 1.6, plane is 2). */
 const FIT_SIZE = 2
-
-/** Gap between the six box-atlas cells so dilation has somewhere to bleed. */
-const ATLAS_MARGIN = 0.04
 
 let loaderPromise: Promise<GLTFLoader> | null = null
 
@@ -110,7 +109,17 @@ export async function loadGltfGeometry(source: File | Blob | ArrayBuffer, fileNa
     throw new Error(`"${name}" has no triangle meshes to paint`)
   }
 
-  const geometry = combine(pieces)
+  packUvLayouts(pieces)
+  let geometry = combine(pieces)
+  // A unique atlas is mandatory for the ray baker: overlapping charts let the
+  // last triangle win, which is the "face AO stamped onto the skull" failure.
+  // Keep an authored unwrap only when it already is unique.
+  if (generatedUVs || uvsOverlap(geometry)) {
+    const unwrapped = uniqueUnwrap(geometry)
+    if (unwrapped !== geometry) geometry.dispose()
+    geometry = unwrapped
+    generatedUVs = true
+  }
   fitToOrigin(geometry)
   prepareGeometry(geometry)
 
@@ -157,10 +166,13 @@ function extractMeshGeometries(object: Object3D): { geometries: BufferGeometry[]
 
 function preparePiece(mesh: Mesh, world: Matrix4): { geometry: BufferGeometry; generatedUVs: boolean } {
   const geometry = mesh.geometry.clone()
+  // Float-expand *before* skinning and matrix bake. Writing a denormalised
+  // position back into a normalised integer attribute would quantise it again
+  // and smear the mesh.
+  compactGeometryAttributes(geometry, ['position', 'normal', 'uv', 'uv1', 'uv2', 'skinWeight'])
   const skinned = asSkinnedMesh(mesh)
   if (skinned) bakeSkin(skinned, geometry)
   geometry.applyMatrix4(world)
-  deinterleaveGeometry(geometry)
   geometry.morphAttributes = {}
   geometry.clearGroups()
 
@@ -176,13 +188,11 @@ function preparePiece(mesh: Mesh, world: Matrix4): { geometry: BufferGeometry; g
   let generatedUVs = false
   if (!geometry.getAttribute('normal')) geometry.computeVertexNormals()
   if (!geometry.getAttribute('uv')) {
-    const unique = geometry.index ? geometry.toNonIndexed() : geometry
-    generateBoxUVs(unique)
+    // Placeholder so mergeGeometries sees the same attributes on every piece.
+    // The real unwrap runs on the combined mesh.
+    const count = geometry.getAttribute('position').count
+    geometry.setAttribute('uv', new BufferAttribute(new Float32Array(count * 2), 2))
     generatedUVs = true
-    if (unique !== geometry) {
-      geometry.dispose()
-      return { geometry: unique, generatedUVs }
-    }
   }
 
   return { geometry, generatedUVs }
@@ -237,6 +247,115 @@ function alignAttributes(pieces: BufferGeometry[]): BufferGeometry[] {
   })
 }
 
+/**
+ * Each glTF primitive usually has its own 0..1 unwrap. Merging them as-is
+ * stacks every island on top of every other, so the ray baker's last triangle
+ * wins and AO/curvature/thickness land on the wrong surface. Pack the pieces
+ * into a unique atlas when their UV rectangles overlap or sit outside 0..1.
+ *
+ * A single primitive that already lives in 0..1 is left alone, so a proper
+ * unique unwrap is not disturbed.
+ */
+function packUvLayouts(pieces: BufferGeometry[]): void {
+  if (pieces.length === 0) return
+  const bounds = pieces.map(uvBounds)
+  const needsPack = pieces.length > 1
+    ? bounds.some((a, i) => bounds.some((b, j) => i < j && uvRectsOverlap(a, b)))
+      || bounds.some((b) => b.minU < -0.001 || b.minV < -0.001 || b.maxU > 1.001 || b.maxV > 1.001)
+    : bounds[0].minU < -0.001 || bounds[0].minV < -0.001 || bounds[0].maxU > 1.001 || bounds[0].maxV > 1.001
+
+  if (!needsPack) return
+
+  const pad = 0.04
+  const boxes = bounds.map((b, i) => ({
+    i,
+    w: Math.max(1e-4, b.maxU - b.minU) + pad,
+    h: Math.max(1e-4, b.maxV - b.minV) + pad,
+    x: 0,
+    y: 0,
+  }))
+  const packed = packRects(boxes)
+  const margin = 0.02
+  const innerW = Math.max(packed.w, 1e-8)
+  const innerH = Math.max(packed.h, 1e-8)
+
+  for (const box of boxes) {
+    const src = bounds[box.i]
+    remapUVs(pieces[box.i], src, {
+      minU: margin + (box.x / innerW) * (1 - margin * 2),
+      minV: margin + (box.y / innerH) * (1 - margin * 2),
+      maxU: margin + ((box.x + box.w) / innerW) * (1 - margin * 2),
+      maxV: margin + ((box.y + box.h) / innerH) * (1 - margin * 2),
+    })
+  }
+}
+
+function uvBounds(geometry: BufferGeometry): { minU: number; minV: number; maxU: number; maxV: number } {
+  const uv = geometry.getAttribute('uv')
+  let minU = Infinity, minV = Infinity, maxU = -Infinity, maxV = -Infinity
+  for (let i = 0; i < uv.count; i++) {
+    const u = uv.getX(i)
+    const v = uv.getY(i)
+    if (u < minU) minU = u
+    if (v < minV) minV = v
+    if (u > maxU) maxU = u
+    if (v > maxV) maxV = v
+  }
+  if (!Number.isFinite(minU)) return { minU: 0, minV: 0, maxU: 1, maxV: 1 }
+  return { minU, minV, maxU, maxV }
+}
+
+function uvRectsOverlap(
+  a: { minU: number; minV: number; maxU: number; maxV: number },
+  b: { minU: number; minV: number; maxU: number; maxV: number },
+): boolean {
+  const eps = 1e-4
+  return a.minU < b.maxU - eps && b.minU < a.maxU - eps && a.minV < b.maxV - eps && b.minV < a.maxV - eps
+}
+
+function packRects(boxes: { w: number; h: number; x: number; y: number }[]): { w: number; h: number } {
+  const sorted = [...boxes].sort((a, b) => b.h - a.h)
+  const area = sorted.reduce((sum, box) => sum + box.w * box.h, 0)
+  const targetW = Math.max(Math.sqrt(area), ...sorted.map((box) => box.w))
+  let x = 0
+  let y = 0
+  let rowH = 0
+  let width = 0
+  let height = 0
+  for (const box of sorted) {
+    if (x > 0 && x + box.w > targetW) {
+      x = 0
+      y += rowH
+      rowH = 0
+    }
+    box.x = x
+    box.y = y
+    x += box.w
+    rowH = Math.max(rowH, box.h)
+    width = Math.max(width, x)
+    height = Math.max(height, y + box.h)
+  }
+  return { w: width, h: height }
+}
+
+function remapUVs(
+  geometry: BufferGeometry,
+  from: { minU: number; minV: number; maxU: number; maxV: number },
+  to: { minU: number; minV: number; maxU: number; maxV: number },
+): void {
+  const uv = geometry.getAttribute('uv')
+  const srcW = Math.max(1e-8, from.maxU - from.minU)
+  const srcH = Math.max(1e-8, from.maxV - from.minV)
+  const dstW = to.maxU - to.minU
+  const dstH = to.maxV - to.minV
+  for (let i = 0; i < uv.count; i++) {
+    const u = to.minU + ((uv.getX(i) - from.minU) / srcW) * dstW
+    const v = to.minV + ((uv.getY(i) - from.minV) / srcH) * dstH
+    uv.setXY(i, u, v)
+  }
+  uv.needsUpdate = true
+}
+
 function fitToOrigin(geometry: BufferGeometry): void {
   geometry.computeBoundingBox()
   const box = geometry.boundingBox
@@ -249,81 +368,6 @@ function fitToOrigin(geometry: BufferGeometry): void {
     const scale = FIT_SIZE / longest
     geometry.scale(scale, scale, scale)
   }
-}
-
-/**
- * Six-direction box atlas. Overlapping within a face is expected - this is a
- * fallback so files without UVs still paint under triplanar, not a production
- * unwrap.
- */
-function generateBoxUVs(geometry: BufferGeometry): void {
-  const position = geometry.getAttribute('position')
-  geometry.computeBoundingBox()
-  const box = geometry.boundingBox ?? new Box3(new Vector3(-1, -1, -1), new Vector3(1, 1, 1))
-  const size = box.getSize(new Vector3())
-  const sx = Math.max(size.x, 1e-8)
-  const sy = Math.max(size.y, 1e-8)
-  const sz = Math.max(size.z, 1e-8)
-
-  const uvs = new Float32Array(position.count * 2)
-  const p0 = new Vector3()
-  const p1 = new Vector3()
-  const p2 = new Vector3()
-  const e1 = new Vector3()
-  const e2 = new Vector3()
-  const n = new Vector3()
-  const p = new Vector3()
-
-  const triangles = Math.floor(position.count / 3)
-  for (let t = 0; t < triangles; t++) {
-    const i0 = t * 3
-    const i1 = i0 + 1
-    const i2 = i0 + 2
-    p0.fromBufferAttribute(position, i0)
-    p1.fromBufferAttribute(position, i1)
-    p2.fromBufferAttribute(position, i2)
-    n.crossVectors(e1.subVectors(p1, p0), e2.subVectors(p2, p0))
-    const ax = Math.abs(n.x)
-    const ay = Math.abs(n.y)
-    const az = Math.abs(n.z)
-
-    let col = 0
-    let row = 0
-    let uOf: (v: Vector3) => number
-    let vOf: (v: Vector3) => number
-    if (ax >= ay && ax >= az) {
-      col = n.x >= 0 ? 0 : 1
-      row = 0
-      uOf = (v) => (n.x >= 0 ? v.z - box.min.z : box.max.z - v.z) / sz
-      vOf = (v) => (v.y - box.min.y) / sy
-    } else if (ay >= ax && ay >= az) {
-      col = 2
-      row = n.y >= 0 ? 0 : 1
-      uOf = (v) => (v.x - box.min.x) / sx
-      vOf = (v) => (n.y >= 0 ? box.max.z - v.z : v.z - box.min.z) / sz
-    } else {
-      col = n.z >= 0 ? 1 : 2
-      row = 1
-      uOf = (v) => (n.z >= 0 ? v.x - box.min.x : box.max.x - v.x) / sx
-      vOf = (v) => (v.y - box.min.y) / sy
-    }
-
-    for (const i of [i0, i1, i2]) {
-      p.fromBufferAttribute(position, i)
-      writeAtlasUv(uvs, i, col, row, uOf(p), vOf(p))
-    }
-  }
-
-  geometry.setAttribute('uv', new BufferAttribute(uvs, 2))
-}
-
-function writeAtlasUv(uvs: Float32Array, index: number, col: number, row: number, fu: number, fv: number): void {
-  const cellW = 1 / 3
-  const cellH = 1 / 2
-  const u = (col + ATLAS_MARGIN + clamp01(fu) * (1 - ATLAS_MARGIN * 2)) * cellW
-  const v = (row + ATLAS_MARGIN + clamp01(fv) * (1 - ATLAS_MARGIN * 2)) * cellH
-  uvs[index * 2] = u
-  uvs[index * 2 + 1] = v
 }
 
 function asMesh(object: Object3D): Mesh | null {
@@ -371,11 +415,6 @@ function describeGltfError(cause: unknown): string {
     return cause.message
   }
   return String(cause)
-}
-
-function clamp01(value: number): number {
-  if (!Number.isFinite(value)) return 0
-  return Math.min(1, Math.max(0, value))
 }
 
 export const GLTF_ACCEPT = '.glb,.gltf,model/gltf-binary,model/gltf+json'

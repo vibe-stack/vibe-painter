@@ -12,6 +12,7 @@ import type { BufferGeometry } from 'three/webgpu'
 import type { BakeSettings } from '../doc/types'
 import type { BakeGeometry } from './bake'
 import type { RayMapData } from '../gpu/meshmaps'
+import { attributeToFloat32 } from '../mesh/attributes'
 
 export interface BakeProgress {
   /** 0..1 across the whole bake. */
@@ -156,10 +157,14 @@ export function extractGeometry(geometry: BufferGeometry): BakeGeometry {
     ? Uint32Array.from(index.array as ArrayLike<number>)
     : Uint32Array.from({ length: position.count }, (_, i) => i)
 
+  // Read through getX/getY/getZ rather than copying `.array`. glTF UVs and
+  // normals are often integer-normalised or interleaved; `.array` is the raw
+  // buffer and would send the CPU baker into a different UV space than the
+  // GPU is sampling.
   return {
-    positions: Float32Array.from(position.array as ArrayLike<number>),
-    normals: Float32Array.from(normal.array as ArrayLike<number>),
-    uvs: Float32Array.from(uvAttr.array as ArrayLike<number>),
+    positions: attributeToFloat32(position, 3),
+    normals: attributeToFloat32(normal, 3),
+    uvs: attributeToFloat32(uvAttr, 2),
     indices,
   }
 }
