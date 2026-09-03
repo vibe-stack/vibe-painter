@@ -23,8 +23,10 @@ import {
   min,
   mix,
   mx_fractal_noise_float,
+  mx_hsvtorgb,
   mx_noise_float,
   mod,
+  mx_rgbtohsv,
   mx_worley_noise_float,
   normalize,
   sin,
@@ -288,3 +290,155 @@ export function gradient3(t: F, a: V3, b: V3, c: V3): V3 {
   const first = mix(a, b, t.mul(2).clamp(0, 1))
   return mix(first, c, t.sub(0.5).mul(2).clamp(0, 1))
 }
+
+// ---------------------------------------------------------------------------
+// Realism helpers
+//
+// The difference between a shader that reads as "a procedural pattern" and one
+// that reads as "a surface" is rarely the pattern itself - it is the second
+// order detail layered over it: colour that varies in hue rather than only in
+// brightness, roughness that is never constant, cavities that actually catch
+// dirt, and a fine normal riding on top of the coarse one. These are the
+// primitives for that, shared so every material gets them the same way.
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-instance colour variation in HSV.
+ *
+ * Real materials vary in *hue* as well as value: two bricks from one kiln
+ * differ by a few degrees of hue and a little saturation, not by a uniform
+ * brightness multiplier. Scaling RGB - which is what a `mul()` does - keeps
+ * the hue locked and is the single most recognisable "this is a shader" tell.
+ *
+ * `t` is a 0..1 selector (a per-cell hash, a noise field); 0.5 is no change.
+ */
+export function tintVariation(
+  colour: V3,
+  t: F,
+  hue: FloatIn = 0.02,
+  saturation: FloatIn = 0.12,
+  value: FloatIn = 0.16,
+): V3 {
+  const hsv = mx_rgbtohsv(colour) as unknown as V3
+  const d = t.sub(0.5).mul(2)
+  const h = fract(hsv.x.add(d.mul(fl(hue))))
+  const s = hsv.y.mul(float(1).add(d.mul(fl(saturation)))).clamp(0, 1)
+  const v = hsv.z.mul(float(1).add(d.mul(fl(value)))).max(0)
+  return mx_hsvtorgb(vec3(h, s, v)) as unknown as V3
+}
+
+/**
+ * Reoriented normal mapping: puts a detail normal on top of a base normal.
+ *
+ * A plain add-and-normalise flattens the detail wherever the base is steep,
+ * and a lerp destroys both. RNM rotates the detail into the base's frame,
+ * which is what keeps fine grain visible on the walls of a deep dent.
+ */
+export function blendDetailNormal(base: V3, detail: V3, strength: FloatIn = 1): V3 {
+  const scaled = normalize(vec3(detail.x.mul(fl(strength)), detail.y.mul(fl(strength)), detail.z))
+  const t = base.add(vec3(0, 0, 1))
+  const u = scaled.mul(vec3(-1, -1, 1))
+  return normalize(t.mul(t.dot(u)).div(max(t.z, float(1e-4))).sub(u))
+}
+
+/**
+ * Cavity occlusion from a height field and the normal already derived from it.
+ *
+ * Two signals, both free: low points are more enclosed than high ones, and a
+ * steep local slope means a wall with something above it. Multiplying them
+ * darkens the *inside* of a crevice rather than the whole low region, which is
+ * what a real AO bake does. It costs nothing extra because both inputs have
+ * already been computed by the time a material writes its bundle - the
+ * alternative, re-sampling the height function in a ring, multiplies the cost
+ * of every material by another four or eight evaluations.
+ */
+export function cavityAO(height01: F, normal: V3, strength: FloatIn = 0.6): F {
+  const s = fl(strength).clamp(0, 1)
+  const fromHeight = mix(float(1).sub(s), float(1), height01.clamp(0, 1))
+  const fromSlope = mix(float(1).sub(s.mul(0.55)), float(1), normal.z.clamp(0, 1).pow(0.7))
+  return fromHeight.mul(fromSlope).clamp(0, 1)
+}
+
+/**
+ * Micro roughness break-up, 0..1 centred on 0.5.
+ *
+ * Constant roughness is physically impossible and reads instantly as CG: even
+ * a polished surface has fingerprints, dust and polish swirl. Every material
+ * in the catalogue folds a little of this in.
+ */
+export function microVariation(p: V2, scale: FloatIn, seed: FloatIn = 0): F {
+  return fbm01(vec3(p.mul(fl(scale)), fl(seed)), 3, 2.3, 0.55)
+}
+
+/**
+ * Isolated bright specks - snow crystals, sand quartz, metal flake.
+ *
+ * Built from a worley field rather than a thresholded noise: the specks land
+ * one per cell, so density is controlled exactly and they never clump into
+ * blobs the way a thresholded fbm does.
+ */
+export function sparkle(p: V2, scale: FloatIn, seed: FloatIn = 0, size: FloatIn = 0.12): F {
+  const d = worley(vec3(p.mul(fl(scale)), fl(seed)), 1)
+  return smoothstep(fl(size), float(0), d)
+}
+
+/**
+ * Crack network. Voronoi borders thresholded to a width, then eroded by noise
+ * so the crack fades out along its length instead of forming a closed mesh -
+ * real cracks terminate, and a perfect polygon net is the giveaway.
+ */
+export function cracks(p: V2, scale: FloatIn, width: FloatIn, seed: FloatIn = 0): F {
+  const cells = voronoi2(p.mul(fl(scale)), float(0.95))
+  const border = voronoiBorder(cells)
+  const line = smoothstep(fl(width), float(0), border)
+  const erosion = fbm01(vec3(p.mul(fl(scale).mul(2.7)), fl(seed)), 3, 2.2, 0.55)
+  return line.mul(smoothstep(float(0.3), float(0.62), erosion))
+}
+
+/**
+ * Gravity-driven streaks: dirt and rust running *down* a surface.
+ *
+ * `down` is how strongly the streak stretches along -V. Materials pass this
+ * only when they know which way is down, which under triplanar means the two
+ * vertical planes (axis 0 and 2) - see `MatContext.axis`.
+ */
+export function drips(p: V2, scale: FloatIn, length: FloatIn, seed: FloatIn = 0): F {
+  const s = fl(scale)
+  // Stretching V compresses the noise vertically, turning blobs into runs.
+  const stretched = vec2(p.x.mul(s), p.y.mul(s).div(max(fl(length), float(0.05))))
+  const field = fbm01(vec3(stretched, fl(seed)), 4, 2.1, 0.55)
+  // The run fades out downwards rather than ending abruptly.
+  return smoothstep(float(0.52), float(0.78), field)
+}
+
+/**
+ * Height-aware blend, the way a real coat sits on a substrate.
+ *
+ * Lerping two materials by a mask gives a soft, uniform transition. Blending
+ * by height instead lets the substrate poke through wherever it is high -
+ * gravel through asphalt, aggregate through a thin skim of cement - which is
+ * what makes a two-material mix look layered rather than dissolved.
+ */
+export function heightBlend(maskValue: F, topHeight: F, bottomHeight: F, contrast: FloatIn = 0.15): F {
+  const c = max(fl(contrast), float(1e-3))
+  const bias = topHeight.sub(bottomHeight).mul(0.5)
+  return smoothstep(float(0.5).sub(c), float(0.5).add(c), maskValue.add(bias).clamp(0, 1))
+}
+
+/**
+ * Rounded-cell field: `(domeHeight, borderDistance, cellId.x, cellId.y)`.
+ *
+ * Pebbles, cobbles, leather grain and hammer dents are all the same shape -
+ * a cell that rises to a rounded top and falls off at its border. Sharing one
+ * function keeps the falloff consistent and saves every one of them
+ * re-deriving it from the raw distances.
+ */
+export const pebbles = /*#__PURE__*/ Fn(([p, jitter, roundness]: [V2, F, F]): V4 => {
+  const cells = voronoi2(p, jitter)
+  const border = cells.y.sub(cells.x)
+  // The dome is driven by the border distance, not by f1: that keeps the top
+  // flat-ish in the middle of the cell and steep only near the seam, which is
+  // how a worn stone actually sits.
+  const dome = smoothstep(float(0), max(roundness, float(1e-3)), border).pow(0.65)
+  return vec4(dome, border, cells.z, cells.w)
+})
