@@ -23,6 +23,8 @@ import type { MeshMaps } from './meshmaps'
 import { SLOT_COUNT, SLOT_NAMES } from '../channels'
 import type { PaintBuffer } from '../gpu/targets'
 import { CHANNEL_TARGET_OPTIONS, SlotTargets } from '../gpu/targets'
+import { Blitter } from './blit'
+import { renderQuad } from './uvspace'
 
 const NEIGHBOURS: [number, number][] = [
   [-1, -1], [0, -1], [1, -1],
@@ -42,6 +44,17 @@ function dilateNode(
   coverage: Texture,
   coverageSwizzle: 'w' | 'x',
   texelSize: V2,
+  /**
+   * Optional UV island mask. When given, only texels *outside* an island may
+   * be filled.
+   *
+   * This is the difference between padding and smearing. Without it the pass
+   * treats "has paint" as "is valid" and floods paint outward in every
+   * direction - across island borders onto entirely different faces, and over
+   * unpainted surface inside the same island, growing a little further with
+   * every stroke. Gutter texels are the only ones that should ever be invented.
+   */
+  islandMask: Texture | null = null,
 ): { outputs: V4[]; coverage: V4 } {
   const uvNode = uv()
   const sampleCoverage = (at: V2): F =>
@@ -65,7 +78,11 @@ function dilateNode(
   }
 
   const keep = step(float(0.001), sampleCoverage(uvNode))
-  const hasNeighbours = step(float(1e-5), weight)
+  // Only gutter texels are fillable when a mask is supplied.
+  const fillable = islandMask
+    ? step(texture(islandMask, uvNode).x, float(0.5))
+    : float(1)
+  const hasNeighbours = step(float(1e-5), weight).mul(fillable)
 
   const outputs = sources.map((tex, i) => {
     const averaged = accum[i].div(max(weight, float(1e-5))).mul(hasNeighbours)
@@ -87,6 +104,7 @@ export class Dilator {
   #coverageMaterial: MeshBasicNodeMaterial | null = null
   #coverageScratch: RenderTarget | null = null
   #sourceKey = ''
+  #blitter = new Blitter()
 
   /** Grows the geometry maps outward so filtering never reads empty gutter. */
   dilateGeometry(renderer: Renderer, maps: MeshMaps, iterations: number): void {
@@ -109,48 +127,39 @@ export class Dilator {
     }
 
     for (let i = 0; i < iterations; i++) {
-      this.#renderQuad(renderer, this.#geometryMaterial, scratch)
-      for (let t = 0; t < maps.geometry.textures.length; t++) {
-        renderer.copyTextureToTexture(scratch.textures[t], maps.geometry.textures[t])
-      }
+      renderQuad(renderer, this.#quad, this.#geometryMaterial, scratch)
+      // Blit rather than copyTextureToTexture: this has to land on exactly the
+      // texels the dilation shader read, and a render pass shares its UV
+      // convention with every other pass by construction.
+      this.#blitter.blit(renderer, scratch.textures, maps.geometry, GEOMETRY_MAP_NAMES)
     }
   }
 
   /** Same, for a painted layer's channel slots and its coverage mask. */
-  dilatePaint(renderer: Renderer, buffer: PaintBuffer, iterations: number): void {
+  dilatePaint(renderer: Renderer, buffer: PaintBuffer, iterations: number, islandMask: Texture | null = null): void {
     if (iterations <= 0) return
     const res = buffer.resolution
     this.#texelSize.value.set(1 / res, 1 / res)
 
     if (buffer.slots) {
       const scratch = this.#ensureSlotScratch(res)
-      const material = this.#ensureSlotMaterial(buffer)
+      const material = this.#ensureSlotMaterial(buffer, islandMask)
       const coverageScratch = this.#ensureCoverageScratch(res)
-      const coverageMaterial = this.#ensureCoverageMaterial(buffer)
+      const coverageMaterial = this.#ensureCoverageMaterial(buffer, islandMask)
       for (let i = 0; i < iterations; i++) {
-        this.#renderQuad(renderer, material, scratch.rt)
-        this.#renderQuad(renderer, coverageMaterial, coverageScratch)
-        for (let s = 0; s < SLOT_COUNT; s++) {
-          renderer.copyTextureToTexture(scratch.texture(s), buffer.slots.texture(s))
-        }
-        renderer.copyTextureToTexture(coverageScratch.texture, buffer.coverage.texture)
+        renderQuad(renderer, this.#quad, material, scratch.rt)
+        renderQuad(renderer, this.#quad, coverageMaterial, coverageScratch)
+        this.#blitter.blit(renderer, scratch.rt.textures, buffer.slots.rt, SLOT_NAMES)
+        this.#blitter.blit(renderer, [coverageScratch.texture], buffer.coverage.rt, ['coverage'])
       }
     } else {
       const coverageScratch = this.#ensureCoverageScratch(res)
-      const coverageMaterial = this.#ensureCoverageMaterial(buffer)
+      const coverageMaterial = this.#ensureCoverageMaterial(buffer, islandMask)
       for (let i = 0; i < iterations; i++) {
-        this.#renderQuad(renderer, coverageMaterial, coverageScratch)
-        renderer.copyTextureToTexture(coverageScratch.texture, buffer.coverage.texture)
+        renderQuad(renderer, this.#quad, coverageMaterial, coverageScratch)
+        this.#blitter.blit(renderer, [coverageScratch.texture], buffer.coverage.rt, ['coverage'])
       }
     }
-  }
-
-  #renderQuad(renderer: Renderer, material: MeshBasicNodeMaterial, target: RenderTarget): void {
-    const previous = renderer.getRenderTarget()
-    renderer.setRenderTarget(target)
-    this.#quad.material = material
-    this.#quad.render(renderer)
-    renderer.setRenderTarget(previous)
   }
 
   #ensureGeometryScratch(res: number): RenderTarget {
@@ -185,9 +194,9 @@ export class Dilator {
     return this.#coverageScratch
   }
 
-  #ensureSlotMaterial(buffer: PaintBuffer): MeshBasicNodeMaterial {
+  #ensureSlotMaterial(buffer: PaintBuffer, islandMask: Texture | null): MeshBasicNodeMaterial {
     const slots = buffer.slots!
-    const key = `slots:${slots.texture(0).id}`
+    const key = `slots:${slots.texture(0).id}:${islandMask?.id ?? 'none'}`
     if (this.#slotMaterial && this.#slotMaterial.userData.key === key) return this.#slotMaterial
     this.#slotMaterial?.dispose()
     const material = new MeshBasicNodeMaterial()
@@ -195,22 +204,22 @@ export class Dilator {
     material.depthWrite = false
     material.blending = NoBlending
     const textures = Array.from({ length: SLOT_COUNT }, (_, i) => slots.texture(i))
-    const { outputs } = dilateNode(textures, buffer.coverage.texture, 'x', this.#texelSize)
+    const { outputs } = dilateNode(textures, buffer.coverage.texture, 'x', this.#texelSize, islandMask)
     material.fragmentNode = mrt(Object.fromEntries(SLOT_NAMES.map((n, i) => [n, outputs[i]])))
     material.userData.key = key
     this.#slotMaterial = material
     return material
   }
 
-  #ensureCoverageMaterial(buffer: PaintBuffer): MeshBasicNodeMaterial {
-    const key = `cov:${buffer.coverage.texture.id}`
+  #ensureCoverageMaterial(buffer: PaintBuffer, islandMask: Texture | null): MeshBasicNodeMaterial {
+    const key = `cov:${buffer.coverage.texture.id}:${islandMask?.id ?? 'none'}`
     if (this.#coverageMaterial && this.#coverageMaterial.userData.key === key) return this.#coverageMaterial
     this.#coverageMaterial?.dispose()
     const material = new MeshBasicNodeMaterial()
     material.depthTest = false
     material.depthWrite = false
     material.blending = NoBlending
-    const { coverage } = dilateNode([buffer.coverage.texture], buffer.coverage.texture, 'x', this.#texelSize)
+    const { coverage } = dilateNode([buffer.coverage.texture], buffer.coverage.texture, 'x', this.#texelSize, islandMask)
     material.fragmentNode = coverage
     material.userData.key = key
     this.#coverageMaterial = material
@@ -224,5 +233,6 @@ export class Dilator {
     this.#slotScratch?.dispose()
     this.#coverageMaterial?.dispose()
     this.#coverageScratch?.dispose()
+    this.#blitter.dispose()
   }
 }

@@ -143,6 +143,9 @@ function Stage({ api, tool, onPaintBlocked }: ViewportProps & { api: VibePainter
       return
     }
     api.setBrush({ erase: tool === 'erase' })
+    // Compile the paint pipelines the moment a brush tool is picked, so the
+    // first stroke is not swallowed by an in-flight shader compile.
+    api.engine.prewarmPainting()
 
     const onDown = (event: PointerEvent) => {
       if (event.button !== 0) return

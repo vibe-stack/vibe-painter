@@ -4,8 +4,9 @@
  * Painting is not "drawing on the mesh". The mesh is a projection surface; the
  * pixels live in UV space. A stroke works like this:
  *
- *  1. The mesh is rasterised into its own UV layout (see `uvspace.ts`), so
- *     every fragment knows both which texel it is and where in 3D it sits.
+ *  1. The geometry bake has already put a world position, normal and tangent
+ *     frame in every texel (see `meshmaps.ts`), so a fullscreen pass over the
+ *     texture knows where in 3D each of its texels sits.
  *  2. Each fragment asks whether it falls inside any of the brush stamps in
  *     this batch - a 3D distance test, plus a normal-facing test so the back
  *     of a thin wall is not painted through.
@@ -15,6 +16,9 @@
  *     against the previous frame. That is what makes a slow, low-flow stroke
  *     build up smoothly instead of banding at every pointer event.
  *  5. On stroke end the result is dilated past UV island borders.
+ *
+ * Every pass here reads and writes at the same uv, with no flips anywhere -
+ * see `sampling.ts` for why that is the only convention that can be right.
  */
 
 import {
@@ -22,28 +26,23 @@ import {
   MaxEquation,
   MeshBasicNodeMaterial,
   NoBlending,
-  NodeMaterial,
   OneFactor,
   QuadMesh,
+  Scene,
   Vector3,
 } from 'three/webgpu'
-import type { BufferGeometry, Renderer } from 'three/webgpu'
+import type { BufferGeometry, Renderer, Texture } from 'three/webgpu'
 import {
   Fn,
   If,
   Loop,
-  cross,
   dot,
   float,
   length,
   max,
   mix,
   mrt,
-  normalWorld,
-  positionWorld,
   smoothstep,
-  tangentGeometry,
-  tangentWorld,
   texture,
   uniform,
   uv,
@@ -60,11 +59,11 @@ import { fbm01, voronoi2 } from '../procedural/noise'
 import type { MeshMaps } from './meshmaps'
 import type { F, V2, V4 } from './nodes'
 import { packBundle, unpackSlots } from './packing'
-import { rtUv } from './sampling'
 import { CoverageTarget, SlotTargets } from './targets'
 import type { PaintBuffer } from './targets'
 import { vec4ArrayUniform } from './bindings'
-import { UVSpacePass, uvClipPosition, clearTarget } from './uvspace'
+import { clearTarget, renderQuad } from './uvspace'
+import { Blitter } from './blit'
 import type { Dilator } from './dilate'
 
 /** Stamps evaluated per draw. Longer batches are split across draws. */
@@ -130,7 +129,6 @@ interface BrushMaterialSpec {
 }
 
 export class Painter {
-  #pass = new UVSpacePass()
   #quad = new QuadMesh()
 
   #stroke: CoverageTarget
@@ -152,8 +150,23 @@ export class Painter {
   #strokeOpacity = uniform(1)
   #eraseMode = uniform(0)
 
-  #stampMaterial: NodeMaterial | null = null
+  #stampMaterial: MeshBasicNodeMaterial | null = null
+  /**
+   * Identity of the mesh maps the cached materials were built against.
+   *
+   * The graphs bind specific texture objects, and `MeshMaps.nodes()` hands back
+   * neutral constants until the geometry bake has run. A material built during
+   * that window keeps a world position of (0,0,0) forever, so every brush test
+   * fails and nothing is ever painted - silently. Rebuilding when the maps
+   * change is what keeps the cache honest.
+   */
+  #mapsKey = ''
   #commitMaterials = new Map<string, MeshBasicNodeMaterial>()
+  /** Pipelines already compiled, keyed by commit key plus geometry. */
+  #warmed = new Set<string>()
+  /** Host scene used only to hand the commit quad to `compileAsync`. */
+  #quadScene = new Scene()
+  #blitter = new Blitter()
 
   #active: {
     target: StrokeTarget
@@ -189,8 +202,6 @@ export class Painter {
    */
   begin(
     renderer: Renderer,
-    geometry: BufferGeometry,
-    maps: MeshMaps,
     target: StrokeTarget,
     brush: BrushSettings,
     spec: BrushMaterialSpec,
@@ -199,11 +210,17 @@ export class Painter {
     this.end(renderer, null)
 
     clearTarget(renderer, this.#stroke.rt)
-    renderer.copyTextureToTexture(target.buffer.coverage.texture, this.#baselineCoverage.texture)
+    // Snapshot the layer as it stands. Every commit during this stroke
+    // recomposites from here rather than from the previous commit, which is
+    // what stops a slow stroke from building up darker than a fast one.
+    this.#blitter.blit(renderer, [target.buffer.coverage.texture], this.#baselineCoverage.rt, ['coverage'])
     if (target.buffer.slots) {
-      for (let i = 0; i < SLOT_COUNT; i++) {
-        renderer.copyTextureToTexture(target.buffer.slots.texture(i), this.#baselineSlots.texture(i))
-      }
+      this.#blitter.blit(
+        renderer,
+        Array.from({ length: SLOT_COUNT }, (_, i) => target.buffer.slots!.texture(i)),
+        this.#baselineSlots.rt,
+        SLOT_NAMES,
+      )
     }
 
     this.#hardness.value = brush.hardness
@@ -217,17 +234,72 @@ export class Painter {
 
     this.#active = { target, brush, spec, params, lastPoint: null, carry: 0, pending: [], painted: false }
 
-    // Compile both pipelines now, with a no-op draw each.
-    //
-    // WebGPU pipeline creation is asynchronous, and three skips a draw whose
-    // pipeline is still compiling. Building these lazily mid-stroke meant the
-    // opening stamps of a stroke were silently dropped - which reads as "I have
-    // to scrub over it several times before anything appears". A stamp pass
-    // with zero stamps and a commit against an empty stroke buffer both leave
-    // the target exactly as it was, so this is free apart from the compile.
-    this.#stampCount.value = 0
-    this.#pass.render(renderer, geometry, this.#stampMaterialFor(), this.#stroke.rt, false)
-    this.#commit(renderer, maps)
+  }
+
+  /**
+   * Compiles the stamp and commit pipelines before any stroke needs them.
+   *
+   * WebGPU builds pipelines asynchronously and three *skips* a draw whose
+   * pipeline is not ready yet. A stroke is a synchronous burst of draws, so
+   * building these lazily on first use meant the entire first stroke - often
+   * several - was silently discarded. That is the "I have to scrub over it a
+   * dozen times before anything appears" symptom, and no amount of extra
+   * drawing fixes it because every attempt races the same compile.
+   *
+   * Compiling is done with the real render targets bound, because the pipeline
+   * depends on the attachment formats: warming against the canvas would
+   * compile a different pipeline than the one the stroke actually uses.
+   */
+  async prewarm(
+    renderer: Renderer,
+    geometry: BufferGeometry,
+    maps: MeshMaps,
+    target: StrokeTarget,
+    spec: BrushMaterialSpec,
+    params: ParamBag,
+  ): Promise<void> {
+    this.#syncMapsKey(maps)
+    // Nothing to compile against until the geometry maps exist; the engine
+    // calls this again once they do.
+    if (!maps.geometryBaked) return
+    const key = `${this.#commitKey(spec, target)}|${geometry.id}`
+    if (this.#warmed.has(key)) return
+    this.#warmed.add(key)
+
+    const previous = renderer.getRenderTarget()
+    try {
+      this.#quadScene.add(this.#quad)
+      this.#quad.material = this.#stampMaterialFor(maps)
+      renderer.setRenderTarget(this.#stroke.rt)
+      await renderer.compileAsync(this.#quadScene, this.#quad.camera)
+
+      if (target.buffer.slots) {
+        this.#quadScene.add(this.#quad)
+        this.#quad.material = this.#commitMaterial(target, spec, params, maps)
+        renderer.setRenderTarget(target.buffer.slots.rt)
+        await renderer.compileAsync(this.#quadScene, this.#quad.camera)
+      }
+
+      this.#quadScene.add(this.#quad)
+      this.#quad.material = this.#coverageCommitMaterial()
+      renderer.setRenderTarget(target.buffer.coverage.rt)
+      await renderer.compileAsync(this.#quadScene, this.#quad.camera)
+
+      // The baseline snapshot is a pass like any other and can be skipped while
+      // its pipeline compiles - which would silently lose the existing paint.
+      await this.#blitter.prewarm(renderer, [target.buffer.coverage.texture], this.#baselineCoverage.rt, ['coverage'])
+      if (target.buffer.slots) {
+        await this.#blitter.prewarm(
+          renderer,
+          Array.from({ length: SLOT_COUNT }, (_, i) => target.buffer.slots!.texture(i)),
+          this.#baselineSlots.rt,
+          SLOT_NAMES,
+        )
+      }
+    } finally {
+      this.#quadScene.remove(this.#quad)
+      renderer.setRenderTarget(previous)
+    }
   }
 
   /**
@@ -235,7 +307,7 @@ export class Painter {
    * brush's spacing, so stroke density does not depend on how fast the pointer
    * moved or how often the browser sampled it.
    */
-  move(renderer: Renderer, geometry: BufferGeometry, maps: MeshMaps, sample: StrokeSample): void {
+  move(renderer: Renderer, maps: MeshMaps, sample: StrokeSample): void {
     const active = this.#active
     if (!active) return
 
@@ -270,20 +342,20 @@ export class Painter {
     }
 
     if (active.pending.length === 0) return
-    this.#flush(renderer, geometry, maps)
+    this.#flush(renderer, maps)
   }
 
   /** Ends the stroke, dilates the result, and reports whether anything changed. */
-  end(renderer: Renderer, dilator: Dilator | null, dilation = 8): boolean {
+  end(renderer: Renderer, dilator: Dilator | null, dilation = 4, islandMask: Texture | null = null): boolean {
     const active = this.#active
     if (!active) return false
     this.#active = null
     if (!active.painted) return false
-    if (dilator) dilator.dilatePaint(renderer, active.target.buffer, dilation)
+    if (dilator) dilator.dilatePaint(renderer, active.target.buffer, dilation, islandMask)
     return true
   }
 
-  #flush(renderer: Renderer, geometry: BufferGeometry, maps: MeshMaps): void {
+  #flush(renderer: Renderer, maps: MeshMaps): void {
     const active = this.#active
     if (!active) return
 
@@ -298,17 +370,30 @@ export class Painter {
         nrmValue.set(n[0], n[1], n[2], s.pressure ?? 1)
       }
       this.#stampCount.value = batch.length
-      this.#pass.render(renderer, geometry, this.#stampMaterialFor(), this.#stroke.rt, false)
+      renderQuad(renderer, this.#quad, this.#stampMaterialFor(maps), this.#stroke.rt)
     }
     active.pending.length = 0
     active.painted = true
     this.#commit(renderer, maps)
   }
 
-  #stampMaterialFor(): NodeMaterial {
+  /**
+   * The stamp pass.
+   *
+   * This used to rasterise the mesh into UV space to get a world position per
+   * texel. It does not need to: the geometry bake already stores exactly that,
+   * verified against the mesh, in `geomPosition`. Reading it turns the stamp
+   * into a plain fullscreen pass - no vertex stage, no varyings, no dependence
+   * on how a `vertexNode`-overridden material interpolates - and the texel a
+   * fragment writes is by construction the texel whose position it tested.
+   *
+   * It is also faster: one quad instead of every triangle of the mesh, per
+   * stamp batch.
+   */
+  #stampMaterialFor(maps: MeshMaps): MeshBasicNodeMaterial {
+    this.#syncMapsKey(maps)
     if (this.#stampMaterial) return this.#stampMaterial
-    const material = new NodeMaterial()
-    material.vertexNode = uvClipPosition()
+    const material = new MeshBasicNodeMaterial()
     material.depthTest = false
     material.depthWrite = false
     material.transparent = true
@@ -319,9 +404,20 @@ export class Painter {
     material.blendSrc = OneFactor
     material.blendDst = OneFactor
 
-    // Wrapped in `Fn` because TSL only permits `toVar`/`assign` inside a
-    // shader function stack; at module scope there is nothing to assign into.
+    const uvNode = uv()
+    const surface = maps.nodes(uvNode)
+
     const coverageFn = Fn(() => {
+      // Sample the mesh maps once, into locals, *before* any control flow.
+      // WGSL requires texture sampling to happen in uniform control flow, and
+      // these are loop-invariant anyway - reading them inside the `If` is both
+      // undefined behaviour and pure waste.
+      const surfacePosition = surface.worldPosition.toVar('brushSurfacePos')
+      const surfaceNormal = surface.normal.toVar('brushSurfaceNormal')
+      const surfaceTangent = surface.tangent.toVar('brushSurfaceTangent')
+      const surfaceBitangent = surface.bitangent.toVar('brushSurfaceBitangent')
+      const surfaceCoverage = surface.coverage.toVar('brushSurfaceCoverage')
+
       const coverage = float(0).toVar('brushCoverage')
       Loop({ start: 0, end: MAX_STAMPS, type: 'int' }, ({ i }) => {
         If(float(i).lessThan(this.#stampCount), () => {
@@ -329,20 +425,17 @@ export class Painter {
           const aux = this.#stampNrm.element(i)
           const centre = stamp.xyz
           const radius = max(stamp.w, float(1e-5))
-          const delta = positionWorld.sub(centre)
+          const delta = surfacePosition.sub(centre)
           const distance = length(delta)
 
           // Radial falloff. Hardness moves the inner edge of the ramp outward.
-          const inner = radius.mul(this.#hardness.clamp(0, 0.99))
           // Forward edges only: WGSL leaves smoothstep indeterminate when
-          // low >= high, which silently broke the entire brush falloff.
+          // low >= high, which silently broke the whole brush falloff.
+          const inner = radius.mul(this.#hardness.clamp(0, 0.99))
           const radial = smoothstep(inner, radius, distance).oneMinus()
 
           // Local frame so shaped alphas orient with the surface, not the world.
-          // Rebuilt here from tangent + normal to match three's handedness rule.
-          const tangent = vec3(tangentWorld)
-          const bitangent = cross(vec3(normalWorld), tangent).mul(tangentGeometry.w)
-          const local = vec2(dot(delta, tangent), dot(delta, bitangent)).div(radius)
+          const local = vec2(dot(delta, surfaceTangent), dot(delta, surfaceBitangent)).div(radius)
           const shaped = this.#alphaShape(local, radial)
 
           // Reject surfaces facing away from the stroke: this is what stops a
@@ -350,14 +443,15 @@ export class Painter {
           const facing = smoothstep(
             this.#facing.mul(2).sub(1),
             this.#facing.mul(2).sub(1).add(0.25),
-            dot(normalWorld, aux.xyz),
+            dot(surfaceNormal, aux.xyz),
           )
 
           const value = shaped.mul(facing).mul(this.#flow).mul(aux.w)
           coverage.assign(max(coverage, value.clamp(0, 1)))
         })
       })
-      return coverage
+      // Texels outside every UV island have no real surface behind them.
+      return coverage.mul(surfaceCoverage.clamp(0, 1))
     })
 
     const coverage = coverageFn()
@@ -400,16 +494,22 @@ export class Painter {
     if (!active) return
     const material = this.#commitMaterial(active.target, active.spec, active.params, maps)
 
-    const previous = renderer.getRenderTarget()
-    this.#quad.material = material
     if (active.target.kind === 'material' && active.target.buffer.slots) {
-      renderer.setRenderTarget(active.target.buffer.slots.rt)
-      this.#quad.render(renderer)
+      renderQuad(renderer, this.#quad, material, active.target.buffer.slots.rt)
     }
-    renderer.setRenderTarget(active.target.buffer.coverage.rt)
-    this.#quad.material = this.#coverageCommitMaterial()
-    this.#quad.render(renderer)
-    renderer.setRenderTarget(previous)
+    renderQuad(renderer, this.#quad, this.#coverageCommitMaterial(), active.target.buffer.coverage.rt)
+  }
+
+  /** Drops every cached graph if the mesh maps it was built against changed. */
+  #syncMapsKey(maps: MeshMaps): void {
+    const key = `${maps.geometryBaked ? 1 : 0}:${maps.rayBaked ? 1 : 0}:${maps.geometry.textures.map((t) => t.id).join(',')}`
+    if (key === this.#mapsKey) return
+    this.#mapsKey = key
+    this.#stampMaterial?.dispose()
+    this.#stampMaterial = null
+    for (const material of this.#commitMaterials.values()) material.dispose()
+    this.#commitMaterials.clear()
+    this.#warmed.clear()
   }
 
   #commitKey(spec: BrushMaterialSpec, target: StrokeTarget): string {
@@ -422,6 +522,7 @@ export class Painter {
     params: ParamBag,
     maps: MeshMaps,
   ): MeshBasicNodeMaterial {
+    this.#syncMapsKey(maps)
     const key = this.#commitKey(spec, target)
     const cached = this.#commitMaterials.get(key)
     if (cached) return cached
@@ -432,9 +533,8 @@ export class Painter {
     material.blending = NoBlending
 
     const uvNode = uv()
-    const sampleUv = rtUv(uvNode)
-    const strokeCoverage = texture(this.#stroke.texture, sampleUv).x.mul(this.#strokeOpacity).clamp(0, 1)
-    const baseCoverage = texture(this.#baselineCoverage.texture, sampleUv).x
+    const strokeCoverage = texture(this.#stroke.texture, uvNode).x.mul(this.#strokeOpacity).clamp(0, 1)
+    const baseCoverage = texture(this.#baselineCoverage.texture, uvNode).x
 
     const def = getMaterialDef(spec.defId)
     const brushBundle = def
@@ -449,12 +549,12 @@ export class Painter {
             rotation: float(spec.projection.rotation),
             sharpness: float(spec.projection.blendSharpness),
           },
-          maps: maps.nodes(sampleUv),
-          uv: sampleUv,
+          maps: maps.nodes(uvNode),
+          uv: uvNode,
         })
       : null
 
-    const baseBundle = unpackSlots(this.#baselineSlots.rt.textures, uvNode, true)
+    const baseBundle = unpackSlots(this.#baselineSlots.rt.textures, uvNode)
     const source = brushBundle ?? baseBundle
 
     // Standard "source over destination", un-premultiplied at the end so the
@@ -487,7 +587,7 @@ export class Painter {
     material.depthTest = false
     material.depthWrite = false
     material.blending = NoBlending
-    const uvNode = rtUv(uv())
+    const uvNode = uv()
     const stroke = texture(this.#stroke.texture, uvNode).x.mul(this.#strokeOpacity).clamp(0, 1)
     const base = texture(this.#baselineCoverage.texture, uvNode).x
     const erase = this.#eraseMode
@@ -501,13 +601,13 @@ export class Painter {
   }
 
   dispose(): void {
+    this.#blitter.dispose()
     this.#stroke.dispose()
     this.#baselineSlots.dispose()
     this.#baselineCoverage.dispose()
     this.#stampMaterial?.dispose()
     for (const material of this.#commitMaterials.values()) material.dispose()
     this.#commitMaterials.clear()
-    this.#pass.dispose()
   }
 }
 

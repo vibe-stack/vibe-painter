@@ -8,15 +8,30 @@
  * know which texels are real.
  */
 
-import { NoBlending, NodeMaterial, Vector3 } from 'three/webgpu'
+import { MeshBasicNodeMaterial, NoBlending, NodeMaterial, QuadMesh, Vector3 } from 'three/webgpu'
 import type { BufferGeometry, Renderer } from 'three/webgpu'
-import { mrt, normalWorld, positionWorld, tangentGeometry, tangentWorld, uniform, vec4 } from 'three/tsl'
+import {
+  mrt,
+  modelNormalMatrix,
+  modelWorldMatrix,
+  normalLocal,
+  normalize,
+  positionWorld,
+  tangentGeometry,
+  tangentLocal,
+  texture,
+  uniform,
+  uv,
+  vec4,
+} from 'three/tsl'
 import { GEOMETRY_MAP_NAMES, MeshMaps } from './meshmaps'
-import { UVSpacePass, uvClipPosition } from './uvspace'
+import { UVSpacePass, renderQuad, uvClipPosition } from './uvspace'
 
 export class GeometryBaker {
   #pass = new UVSpacePass()
+  #quad = new QuadMesh()
   #material: NodeMaterial | null = null
+  #maskMaterial: MeshBasicNodeMaterial | null = null
   #bboxMin = uniform(new Vector3(0, 0, 0))
   #bboxSize = uniform(new Vector3(1, 1, 1))
 
@@ -31,13 +46,27 @@ export class GeometryBaker {
     // 0..1 space regardless of mesh scale, and keeps half-float precision
     // useful across the whole model.
     const normalised = positionWorld.sub(this.#bboxMin).div(this.#bboxSize)
+
+    // Transform the normal by hand rather than using `normalWorld`.
+    //
+    // `normalWorld` is face-direction corrected: three flips it for back-facing
+    // fragments so that double-sided surfaces light correctly. That is right
+    // for a camera render and completely wrong here, because this pass
+    // rasterises the mesh into its *UV layout* - "front facing" then means
+    // "wound anticlockwise in UV space", which has nothing to do with the
+    // geometry. The result is a normal map inverted on whichever islands happen
+    // to be wound the other way, per triangle. Everything that reads this map
+    // then misbehaves in a way that follows the UV layout instead of the model.
+    const worldNormal = normalize(modelNormalMatrix.mul(normalLocal))
+    const worldTangent = normalize(modelWorldMatrix.mul(vec4(tangentLocal, 0)).xyz)
+
     material.fragmentNode = mrt({
       [GEOMETRY_MAP_NAMES[0]]: vec4(normalised, 1),
       // Handedness rides in .w so the bitangent can be reconstructed with a
       // single cross product, matching three's own convention
       // (bitangent = cross(normal, tangent) * tangent.w).
-      [GEOMETRY_MAP_NAMES[1]]: vec4(normalWorld, tangentGeometry.w),
-      [GEOMETRY_MAP_NAMES[2]]: vec4(tangentWorld, 0),
+      [GEOMETRY_MAP_NAMES[1]]: vec4(worldNormal, tangentGeometry.w),
+      [GEOMETRY_MAP_NAMES[2]]: vec4(worldTangent, 0),
     })
     this.#material = material
     return material
@@ -61,13 +90,33 @@ export class GeometryBaker {
     )
 
     this.#pass.render(renderer, geometry, this.#buildMaterial(), maps.geometry, true)
+    // Snapshot which texels are real surface *before* dilation floods the
+    // coverage channel outward. Paint padding needs this unflooded answer.
+    this.#captureIslandMask(renderer, maps)
     maps.markGeometryBaked(min, max)
     return { min, max }
+  }
+
+  #captureIslandMask(renderer: Renderer, maps: MeshMaps): void {
+    if (!this.#maskMaterial || this.#maskMaterial.userData.source !== maps.geometry.textures[0].id) {
+      this.#maskMaterial?.dispose()
+      const material = new MeshBasicNodeMaterial()
+      material.depthTest = false
+      material.depthWrite = false
+      material.blending = NoBlending
+      const coverage = texture(maps.geometry.textures[0], uv()).w
+      material.fragmentNode = vec4(coverage, coverage, coverage, coverage)
+      material.userData.source = maps.geometry.textures[0].id
+      this.#maskMaterial = material
+    }
+    renderQuad(renderer, this.#quad, this.#maskMaterial, maps.islandMask)
   }
 
   dispose(): void {
     this.#material?.dispose()
     this.#material = null
+    this.#maskMaterial?.dispose()
+    this.#maskMaterial = null
     this.#pass.dispose()
   }
 }

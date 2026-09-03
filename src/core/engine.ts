@@ -258,6 +258,7 @@ export class Engine {
     this.#syncPaintBuffers(set)
     this.#compositor.sync(set)
     this.events.emit('documentChanged', { reason })
+    this.prewarmPainting()
     this.#notify(reason)
   }
 
@@ -423,6 +424,8 @@ export class Engine {
     this.#dilator.dilateGeometry(renderer, this.#meshMaps, 16)
     if (options.rebuildGraph === false) this.#compositor.invalidate()
     else this.#compositor.invalidateGraph()
+    // The brush graphs read these maps, so they have to be rebuilt too.
+    this.prewarmPainting()
     if (options.rebuildGraph !== false) this.#needsViewportRebuild = true
     if (!options.silent) this.events.emit('bakeComplete', { kind: 'geometry' })
   }
@@ -496,6 +499,7 @@ export class Engine {
         this.#brushParams.set(key, value)
       }
     }
+    this.prewarmPainting()
     this.#notify('brushMaterial')
   }
 
@@ -505,6 +509,7 @@ export class Engine {
 
   setPaintTarget(kind: PaintTargetKind): void {
     this.#paintTarget = kind
+    this.prewarmPainting()
     this.#notify('paintTarget')
   }
 
@@ -532,18 +537,37 @@ export class Engine {
     return buffer ? { buffer, kind: 'material' } : null
   }
 
+  /**
+   * Compiles the paint pipelines for whatever the current target is, so the
+   * first stroke is not lost to an in-flight shader compile. Safe and cheap to
+   * call repeatedly - the painter remembers what it has already compiled.
+   */
+  prewarmPainting(): void {
+    const renderer = this.#renderer
+    const geometry = this.geometry
+    const target = this.#resolveStrokeTarget()
+    if (!renderer || !geometry || !target) return
+    void this.#painter
+      .prewarm(renderer, geometry, this.#meshMaps, target, {
+        defId: this.#brushMaterial.defId,
+        params: this.#brushMaterial.params,
+        projection: this.#brushProjection,
+      }, this.#brushParams)
+      .catch((cause) => this.events.emit('error', { message: 'Could not prepare the brush', cause }))
+  }
+
   beginStroke(sample: StrokeSample): boolean {
     const renderer = this.#renderer
     const geometry = this.geometry
     const target = this.#resolveStrokeTarget()
     if (!renderer || !geometry || !target) return false
 
-    this.#painter.begin(renderer, geometry, this.#meshMaps, target, this.#brush, {
+    this.#painter.begin(renderer, target, this.#brush, {
       defId: this.#brushMaterial.defId,
       params: this.#brushMaterial.params,
       projection: this.#brushProjection,
     }, this.#brushParams)
-    this.#painter.move(renderer, geometry, this.#meshMaps, sample)
+    this.#painter.move(renderer, this.#meshMaps, sample)
     this.#compositeNow()
     return true
   }
@@ -552,14 +576,14 @@ export class Engine {
     const renderer = this.#renderer
     const geometry = this.geometry
     if (!renderer || !geometry || !this.#painter.isStroking) return
-    this.#painter.move(renderer, geometry, this.#meshMaps, sample)
+    this.#painter.move(renderer, this.#meshMaps, sample)
     this.#compositeNow()
   }
 
   endStroke(): void {
     const renderer = this.#renderer
     if (!renderer) return
-    const painted = this.#painter.end(renderer, this.#dilator, 8)
+    const painted = this.#painter.end(renderer, this.#dilator, 4, this.#meshMaps.islandMask.texture)
     if (painted) {
       this.#compositeNow()
       this.events.emit('documentChanged', { reason: 'stroke' })

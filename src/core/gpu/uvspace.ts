@@ -13,7 +13,7 @@
  */
 
 import { OrthographicCamera, Scene, Mesh, DoubleSide } from 'three/webgpu'
-import type { BufferGeometry, Material, Renderer, RenderTarget } from 'three/webgpu'
+import type { BufferGeometry, Material, QuadMesh, Renderer, RenderTarget } from 'three/webgpu'
 import { cameraProjectionMatrix, float, uv, vec4 } from 'three/tsl'
 import type { V2, V4 } from './nodes'
 
@@ -59,15 +59,57 @@ export class UVSpacePass {
     this.mesh.material = material
     material.side = DoubleSide
 
-    const previous = renderer.getRenderTarget()
+    const previousTarget = renderer.getRenderTarget()
+    const previousAutoClear = renderer.autoClear
+    // `clear` is the whole story about what happens to the target: see
+    // `renderQuad` for why `autoClear` cannot be left to decide it.
+    renderer.autoClear = false
     renderer.setRenderTarget(target)
-    if (clear) renderer.clear(true, false, false)
-    renderer.render(this.scene, this.camera)
-    renderer.setRenderTarget(previous)
+    try {
+      if (clear) renderer.clear(true, false, false)
+      renderer.render(this.scene, this.camera)
+    } finally {
+      renderer.autoClear = previousAutoClear
+      renderer.setRenderTarget(previousTarget)
+    }
   }
 
   dispose(): void {
     this.scene.remove(this.mesh)
+  }
+}
+
+/**
+ * Draws a fullscreen quad into `target`, leaving whatever is already there.
+ *
+ * `QuadMesh.render()` calls `renderer.render()`, which honours `autoClear` -
+ * on by default - and therefore *clears the bound render target before
+ * drawing*. For a pass that overwrites every texel that is only wasted
+ * bandwidth. For the brush stamp it was fatal: a stroke accumulates its dabs
+ * into one buffer with a MAX blend over many draws, and each draw was wiping
+ * every dab that came before it. A whole stroke collapsed into whichever
+ * handful of dabs the last draw happened to contain - one dab under the
+ * cursor, no matter how far you dragged.
+ *
+ * Every offscreen pass in the paint pipeline goes through here, so no pass can
+ * quietly reintroduce that by forgetting.
+ */
+export function renderQuad(
+  renderer: Renderer,
+  quad: QuadMesh,
+  material: Material,
+  target: RenderTarget,
+): void {
+  const previousTarget = renderer.getRenderTarget()
+  const previousAutoClear = renderer.autoClear
+  renderer.autoClear = false
+  renderer.setRenderTarget(target)
+  quad.material = material
+  try {
+    quad.render(renderer)
+  } finally {
+    renderer.autoClear = previousAutoClear
+    renderer.setRenderTarget(previousTarget)
   }
 }
 

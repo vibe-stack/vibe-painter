@@ -23,6 +23,7 @@ import {
   LinearFilter,
   NoColorSpace,
   RGBAFormat,
+  RedFormat,
   RenderTarget,
   Vector3,
 } from 'three/webgpu'
@@ -44,6 +45,15 @@ export interface RayMapData {
 export class MeshMaps {
   /** MRT target holding the three geometry maps. */
   readonly geometry: RenderTarget
+  /**
+   * Which texels are actually inside a UV island, *before* dilation.
+   *
+   * The geometry maps get flooded outward so filtering never samples empty
+   * gutter, which by design leaves their coverage channel reading 1
+   * everywhere. Padding paint needs the opposite question - "is this texel real
+   * surface?" - so the unflooded answer is kept separately.
+   */
+  readonly islandMask: RenderTarget
   resolution: number
 
   #rayTexture: DataTexture | null = null
@@ -61,6 +71,8 @@ export class MeshMaps {
     GEOMETRY_MAP_NAMES.forEach((name, i) => {
       this.geometry.textures[i].name = name
     })
+    this.islandMask = new RenderTarget(resolution, resolution, { ...CHANNEL_TARGET_OPTIONS, format: RedFormat })
+    this.islandMask.texture.name = 'islandMask'
   }
 
   get geometryBaked(): boolean {
@@ -113,6 +125,7 @@ export class MeshMaps {
     if (resolution === this.resolution) return
     this.resolution = resolution
     this.geometry.setSize(resolution, resolution)
+    this.islandMask.setSize(resolution, resolution)
     // The geometry maps no longer describe anything until they are re-rendered.
     this.#geometryBaked = false
   }
@@ -151,12 +164,14 @@ export class MeshMaps {
       curvature: ray ? ray.y : float(0.5),
       thickness: ray ? ray.z : float(0.5),
       coverage,
+      island: texture(this.islandMask.texture, uvNode).x,
       baked: ray !== null,
     }
   }
 
   dispose(): void {
     this.geometry.dispose()
+    this.islandMask.dispose()
     this.#rayTexture?.dispose()
     this.#rayTexture = null
   }
@@ -174,6 +189,7 @@ export function neutralMeshMaps(): MeshMapNodes {
     curvature: float(0.5),
     thickness: float(0.5),
     coverage: float(1),
+    island: float(1),
     baked: false,
   }
 }

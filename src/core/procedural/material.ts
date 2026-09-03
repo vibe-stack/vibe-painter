@@ -38,8 +38,10 @@ export interface MeshMapNodes {
   curvature: F
   /** Thickness: 0 = paper thin, 1 = deep solid. */
   thickness: F
-  /** 1 inside a UV island, 0 in the gutter. */
+  /** 1 inside a UV island, 0 in the gutter. Grows as maps are dilated. */
   coverage: F
+  /** 1 inside a UV island, 0 outside. Never dilated, so always the truth. */
+  island: F
   /** True when real baked maps are bound rather than neutral fallbacks. */
   baked: boolean
 }

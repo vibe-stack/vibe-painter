@@ -38,6 +38,7 @@ import { packBundle, unpackSlots } from './packing'
 import type { PaintBuffer } from './targets'
 import { SlotTargets } from './targets'
 import { blurredCoverage } from './sampling'
+import { renderQuad } from './uvspace'
 
 interface BuildContext {
   uv: V2
@@ -124,11 +125,7 @@ export class Compositor {
     }
     if (!this.#needsComposite && this.#rebuildDraws === 0) return false
 
-    const previous = renderer.getRenderTarget()
-    renderer.setRenderTarget(this.output.rt)
-    this.#quad.material = this.#material!
-    this.#quad.render(renderer)
-    renderer.setRenderTarget(previous)
+    renderQuad(renderer, this.#quad, this.#material!, this.output.rt)
     this.#needsComposite = false
     if (this.#rebuildDraws > 0) {
       this.#rebuildDraws--
@@ -199,7 +196,7 @@ export class Compositor {
       } else {
         const buffer = ctx.buffers.get(layer.paintBufferId)
         if (buffer?.slots) {
-          src = unpackSlots(buffer.slots.rt.textures, ctx.uv, true)
+          src = unpackSlots(buffer.slots.rt.textures, ctx.uv)
           // Painted pixels only exist where the brush actually landed.
           amount = amount.mul(coverageOf(buffer, ctx))
         }
@@ -235,7 +232,7 @@ export class Compositor {
       const buffer = ctx.buffers.get(mask.paintBufferId)
       if (buffer) {
         const painted = mask.blur > 0
-          ? blurredCoverage(buffer.coverage.texture, ctx.uv, binding.maskBlur.mul(ctx.texel), true)
+          ? blurredCoverage(buffer.coverage.texture, ctx.uv, binding.maskBlur.mul(ctx.texel))
           : coverageOf(buffer, ctx)
         value = blendFloat(mask.paintBlend, value, painted)
       }
@@ -255,7 +252,7 @@ export class Compositor {
 // ---------------------------------------------------------------------------
 
 function coverageOf(buffer: PaintBuffer, ctx: BuildContext): F {
-  return blurredCoverage(buffer.coverage.texture, ctx.uv, null, true)
+  return blurredCoverage(buffer.coverage.texture, ctx.uv, null)
 }
 
 function axisIndex(axis: 'x' | 'y' | 'z'): 0 | 1 | 2 {

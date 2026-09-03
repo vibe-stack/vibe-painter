@@ -7,7 +7,6 @@
  */
 
 import { float, texture, vec4 } from 'three/tsl'
-import { rtUv } from './sampling'
 import type { Texture } from 'three/webgpu'
 import type { Channel } from '../channels'
 import { CHANNEL_INFO, CHANNEL_LIST, SLOT_COUNT, SLOT_NAMES } from '../channels'
@@ -41,9 +40,8 @@ export function packBundle(bundle: ChannelBundle): Record<string, V4> {
 }
 
 /** Slot textures -> bundle, for reading a paint layer or the composite back. */
-export function unpackSlots(textures: readonly Texture[], uvNode: V2, cancelRTFlip = false): ChannelBundle {
-  const uv = cancelRTFlip ? rtUv(uvNode) : uvNode
-  const samples = textures.map((tex) => texture(tex, uv))
+export function unpackSlots(textures: readonly Texture[], uvNode: V2): ChannelBundle {
+  const samples = textures.map((tex) => texture(tex, uvNode))
   const bundle = defaultBundle()
 
   for (const info of CHANNEL_LIST) {

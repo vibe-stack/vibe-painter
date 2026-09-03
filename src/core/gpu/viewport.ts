@@ -33,7 +33,6 @@ import { CHANNEL_INFO } from '../channels'
 import type { MeshMaps } from './meshmaps'
 import type { F, V2, V3 } from './nodes'
 import { unpackSlots } from './packing'
-import { rtUv } from './sampling'
 import type { SlotTargets } from './targets'
 
 /** What the viewport is currently showing. */
@@ -89,7 +88,9 @@ export class ViewportMaterials {
 
   /** (Re)binds the material graphs to a set of composited targets. */
   build(slots: SlotTargets, maps: MeshMaps): void {
-    const uvNode = rtUv(uv())
+    // The mesh's own uv attribute, sampled straight. The compositor writes its
+    // targets in this same space (see `sampling.ts`), so no flip belongs here.
+    const uvNode = uv()
     this.#texel.value.set(1 / slots.resolution, 1 / slots.resolution)
     const bundle = unpackSlots(slots.rt.textures, uvNode)
 
