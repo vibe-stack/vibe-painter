@@ -29,9 +29,9 @@ import {
 } from 'three/webgpu'
 import { CHANNEL_TARGET_OPTIONS } from './targets'
 import type { Texture } from 'three/webgpu'
-import { cross, float, normalize, texture, uniform, vec3 } from 'three/tsl'
+import { cross, float, length, texture, uniform, vec3 } from 'three/tsl'
 import type { MeshMapNodes } from '../procedural/material'
-import type { V2 } from './nodes'
+import type { V2, V3 } from './nodes'
 
 export const GEOMETRY_MAP_NAMES = ['geomPosition', 'geomNormal', 'geomTangent'] as const
 
@@ -144,12 +144,28 @@ export class MeshMaps {
 
     const position = posSample.xyz
     const coverage = posSample.w
-    const normal = normalize(nrmSample.xyz)
-    const handedness = nrmSample.w
-    const tangent = normalize(tanSample.xyz)
+
+    // Every normalise here is guarded, and that is not defensive padding - it
+    // is the difference between a working app and one that turns black.
+    //
+    // Two texels break the naive version. A texel outside any UV island holds
+    // a zero normal and tangent, because nothing rasterised there. A texel at
+    // a pole of a lat/long sphere holds a tangent parallel to its normal,
+    // because that is what the UV layout does there. `normalize()` of a zero
+    // vector is NaN, and NaN does not stay where it is born: the paint commit
+    // evaluates the brush material over the *whole* texture and multiplies by
+    // the stroke's coverage, but `0 * NaN` is NaN, not 0 - so a texel that
+    // received no paint still gets NaN written into it. Dilation then averages
+    // it outward a texel per iteration, the compositor propagates it, and the
+    // model grows a black hole that spreads with every stroke.
+    const normal = safeNormalize(nrmSample.xyz, vec3(0, 0, 1))
+    // Handedness is +/-1 on real surface and 0 in the gutter, which would
+    // collapse the bitangent; anything not negative means +1.
+    const handedness = nrmSample.w.lessThan(0).select(float(-1), float(1))
     // Re-orthogonalise: interpolating and filtering tangents drifts them off
     // the surface, and a skewed frame shows up as tilted normal-mapped detail.
-    const orthoTangent = normalize(tangent.sub(normal.mul(normal.dot(tangent))))
+    const projected = tanSample.xyz.sub(normal.mul(normal.dot(tanSample.xyz)))
+    const orthoTangent = safeNormalize(projected, perpendicularTo(normal))
     const bitangent = cross(normal, orthoTangent).mul(handedness)
 
     const ray = this.#rayTexture ? texture(this.#rayTexture, uvNode) : null
@@ -175,6 +191,28 @@ export class MeshMaps {
     this.#rayTexture?.dispose()
     this.#rayTexture = null
   }
+}
+
+/**
+ * `normalize()` that returns `fallback` instead of NaN for a zero-length
+ * vector. The length test is the whole point - `normalize()` alone cannot
+ * express it, and a NaN here is permanent once it reaches a paint buffer.
+ */
+function safeNormalize(v: V3, fallback: V3): V3 {
+  const len = length(v)
+  return len.greaterThan(float(1e-5)).select(v.div(len), fallback) as V3
+}
+
+/**
+ * Any unit vector perpendicular to `normal`. Used where the baked tangent is
+ * useless - at a lat/long sphere's poles it points straight along the normal,
+ * so Gram-Schmidt leaves nothing to normalise. Picking the axis the normal is
+ * least aligned with keeps the cross product well away from zero.
+ */
+function perpendicularTo(normal: V3): V3 {
+  const helper = normal.z.abs().lessThan(float(0.99)).select(vec3(0, 0, 1), vec3(1, 0, 0)) as V3
+  const t = cross(helper, normal)
+  return t.div(length(t)) as V3
 }
 
 /** Fallbacks used before anything has been baked. */

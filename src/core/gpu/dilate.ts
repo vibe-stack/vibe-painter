@@ -12,7 +12,7 @@
  * wrote.
  */
 
-import { float, max, mix, step, texture, uniform, vec2, vec4 } from 'three/tsl'
+import { float, max, step, texture, uniform, vec2, vec4 } from 'three/tsl'
 import { MeshBasicNodeMaterial, NoBlending, RGBAFormat, RedFormat, RenderTarget, Vector2 } from 'three/webgpu'
 import type { Renderer, Texture } from 'three/webgpu'
 import { QuadMesh } from 'three/webgpu'
@@ -77,20 +77,31 @@ function dilateNode(
     })
   }
 
-  const keep = step(float(0.001), sampleCoverage(uvNode))
+  const own = sampleCoverage(uvNode)
+  const keep = step(float(0.001), own)
   // Only gutter texels are fillable when a mask is supplied.
   const fillable = islandMask
     ? step(texture(islandMask, uvNode).x, float(0.5))
     : float(1)
-  const hasNeighbours = step(float(1e-5), weight).mul(fillable)
+  // A texel is padded only if it holds nothing, sits outside every island, and
+  // has something to copy from. Anything else must come through untouched:
+  // this pass invents gutter, it does not get a say about real texels.
+  const pad = step(float(1e-5), weight).mul(fillable).mul(keep.oneMinus())
+  const padded = pad.greaterThan(float(0.5))
 
   const outputs = sources.map((tex, i) => {
-    const averaged = accum[i].div(max(weight, float(1e-5))).mul(hasNeighbours)
+    const averaged = accum[i].div(max(weight, float(1e-5)))
     const original = texture(tex, uvNode)
-    return mix(averaged, original, keep) as V4
+    // A branch, not a `mix`. Blending would fold `averaged` into every texel
+    // with a weight of zero, and `0 * NaN` is NaN - one bad neighbour would
+    // then poison a texel this pass is supposed to leave alone.
+    return padded.select(averaged, original) as V4
   })
 
-  const grown = max(keep, hasNeighbours)
+  // Padding claims a texel outright; everywhere else the coverage that is
+  // already there is the answer. Rounding it to 0/1 with a `step` threw away
+  // every soft brush edge in the texture and left hard, aliased borders.
+  const grown = padded.select(float(1), own) as F
   return { outputs, coverage: vec4(grown, grown, grown, grown) }
 }
 
