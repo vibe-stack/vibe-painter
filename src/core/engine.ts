@@ -205,7 +205,9 @@ export class Engine {
 
     if (this.#renderer) this.#bakeGeometry()
     this.#meshMaps.clearRayMaps()
-    this.#compositor.invalidateGraph()
+    // The ray map texture the live graph samples has just been disposed, so
+    // this rebuild cannot wait for a deferred compile.
+    this.#compositor.invalidateGraph({ immediate: true })
     this.#needsViewportRebuild = true
 
     // The brush radius is in world units, so a default that suits one model
@@ -278,13 +280,13 @@ export class Engine {
       }
       // A brand-new buffer starts empty, and the compositor must sample the
       // new texture object rather than the disposed one.
-      this.#compositor.invalidateGraph()
+      this.#compositor.invalidateGraph({ immediate: true })
     }
     for (const [id, buffer] of [...this.#paintBuffers]) {
       if (!wanted.has(id)) {
         buffer.dispose()
         this.#paintBuffers.delete(id)
-        this.#compositor.invalidateGraph()
+        this.#compositor.invalidateGraph({ immediate: true })
       }
     }
   }
@@ -449,8 +451,9 @@ export class Engine {
         settings: merged,
         bakedAt: Date.now(),
       }
-      // A new DataTexture means the graphs referencing the old one are stale.
-      this.#compositor.invalidateGraph()
+      // A new DataTexture means the graphs referencing the old one are stale -
+      // and the old one is disposed, so the live shader cannot draw again.
+      this.#compositor.invalidateGraph({ immediate: true })
       this.#needsViewportRebuild = true
       this.events.emit('bakeComplete', { kind: 'rays' })
       this.sync('bake')

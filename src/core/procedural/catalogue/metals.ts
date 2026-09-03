@@ -486,8 +486,10 @@ export const damascusSteel = registerMaterial({
       const w2 = warp(w1, p.float('fold').mul(0.4), 3.3)
       const bands = w2.y.add(w2.x.mul(0.25)).mul(p.float('layers'))
       const wave = bands.sin().mul(0.5).add(0.5)
-      const c = p.float('contrast')
-      return smoothstep(float(0.5).sub(c.mul(0.5).oneMinus().mul(0.5)), float(0.5).add(c.mul(0.45)), wave)
+      // Contrast narrows the band around the midpoint: 1 is a hard etch line,
+      // 0 is a smooth gradient from one alloy to the other.
+      const half = p.float('contrast').oneMinus().mul(0.5).max(0.01)
+      return smoothstep(float(0.5).sub(half), float(0.5).add(half), wave)
     }
 
     const heightAt = (uvNode: V2): F => layerAt(uvNode).oneMinus().mul(p.float('etchDepth'))

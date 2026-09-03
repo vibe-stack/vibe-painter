@@ -563,7 +563,7 @@ export const treeBark = registerMaterial({
       const q = anis(uvNode)
       // Ridged noise gives the sharp V-section of a real furrow; a Worley
       // border would give it a flat bottom, which bark does not have.
-      const furrows = ridged(vec3(warp(vec3(q, offset), 0.35, 1.6)), float(4), float(0.5))
+      const furrows = ridged(warp(vec3(q, offset), 0.35, 1.6), float(4), float(0.5))
       const cross = ridged(vec3(vec2(q.x.mul(0.4), q.y.mul(9)), offset.add(7)), float(3), float(0.5))
       return furrows.mul(0.75).add(cross.mul(p.float('plateBreak')).mul(0.25))
     }

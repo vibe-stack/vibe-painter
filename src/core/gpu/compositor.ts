@@ -16,9 +16,22 @@
  *
  * The cost of fusing is that structural edits recompile a shader. That is why
  * `bindings.ts` pushes everything continuous into uniforms.
+ *
+ * And it is why the rebuild is asynchronous. Picking a material rebuilds the
+ * graph and creates a pipeline; doing that inline meant a frame that blocked
+ * for as long as the driver took, followed by two or three black ones while
+ * WebGPU skipped draws whose pipeline was not ready yet. Instead the *existing*
+ * shader keeps drawing while the replacement is built off the frame and
+ * compiled with `compileAsync`, and the two are swapped only once the new one
+ * is ready to draw. Nothing on screen ever waits for a compile.
+ *
+ * The one case that cannot work that way is a rebuild caused by a resource
+ * disappearing - a paint buffer disposed, a mesh map replaced. The live shader
+ * samples those textures, so it cannot be left running for even one more
+ * frame; `invalidateGraph({ immediate: true })` says so explicitly.
  */
 
-import { MeshBasicNodeMaterial, NoBlending, QuadMesh } from 'three/webgpu'
+import { MeshBasicNodeMaterial, NoBlending, QuadMesh, Scene } from 'three/webgpu'
 import type { Renderer } from 'three/webgpu'
 import { float, mix, mrt, normalize, uv, vec3 } from 'three/tsl'
 import { CHANNEL_LIST } from '../channels'
@@ -39,6 +52,7 @@ import type { PaintBuffer } from './targets'
 import { SlotTargets } from './targets'
 import { blurredCoverage } from './sampling'
 import { renderQuad } from './uvspace'
+import { yieldToBrowser } from './scheduler'
 
 interface BuildContext {
   uv: V2
@@ -58,6 +72,21 @@ export class Compositor {
   #needsComposite = true
   /** Extra draws after a shader rebuild. WebGPU skips the first draw of a new pipeline. */
   #rebuildDraws = 0
+
+  /**
+   * Async rebuild state.
+   *
+   * `#buildToken` is what makes a superseded build harmless: every build takes
+   * a number on the way in and throws its result away if the number moved on
+   * while it was compiling. Without it, a burst of edits - dragging through the
+   * material browser, say - would race several builds and let an early one win.
+   */
+  #buildToken = 0
+  #rebuilding = false
+  /** Set when the live graph references something about to stop existing. */
+  #rebuildImmediate = false
+  /** Host scene, used only to hand the quad to `compileAsync`. */
+  #quadScene = new Scene()
 
   /**
    * Stroke fast path: everything below the layer being painted, frozen.
@@ -91,9 +120,8 @@ export class Compositor {
     if (resolution === this.output.resolution) return
     this.output.setSize(resolution)
     this.#below?.setSize(resolution)
-    this.#needsRebuild = true
-    this.#needsComposite = true
-    this.#belowValid = false
+    // The attachment formats the compiled pipeline was built against are gone.
+    this.invalidateGraph({ immediate: true })
   }
 
   /** Marks the composite stale without touching the graph. */
@@ -117,11 +145,20 @@ export class Compositor {
     this.invalidateGraph()
   }
 
-  /** Forces a shader rebuild, e.g. after mesh maps are (re)bound. */
-  invalidateGraph(): void {
+  /**
+   * Forces a shader rebuild.
+   *
+   * Pass `immediate` when the *reason* for the rebuild is that a texture the
+   * live graph samples has been disposed or replaced. Everything else - a
+   * layer added, a material swapped, a blend mode changed - can and should go
+   * through the asynchronous path, because the old shader still draws
+   * something valid in the meantime.
+   */
+  invalidateGraph(options: { immediate?: boolean } = {}): void {
     this.#needsRebuild = true
     this.#needsComposite = true
     this.#belowValid = false
+    if (options.immediate) this.#rebuildImmediate = true
   }
 
   get dirty(): boolean {
@@ -157,13 +194,28 @@ export class Compositor {
 
   /** Composites, if anything changed since the last call. */
   render(renderer: Renderer, set: TextureSetState, maps: MeshMaps, buffers: Map<string, PaintBuffer>): boolean {
-    if (this.#needsRebuild || !this.#material) {
-      this.#rebuild(set, maps, buffers)
+    if (this.#needsRebuild) {
       this.#needsRebuild = false
-      // The new pipeline's first draw is skipped; autoClear would leave the
-      // target black and a single composite would never recover.
-      this.#rebuildDraws = 3
+      // Two reasons to build inline: there is nothing on screen yet to keep
+      // showing, or what is on screen is about to reference a dead texture.
+      if (!this.#material || this.#rebuildImmediate) {
+        this.#rebuildImmediate = false
+        // Supersede anything in flight, so a build that started before the
+        // resources changed cannot overwrite this one when it lands.
+        this.#buildToken++
+        this.#applyBuild(this.#buildGraph(set, maps, buffers))
+        // The new pipeline's first draw is skipped; autoClear would leave the
+        // target black and a single composite would never recover.
+        this.#rebuildDraws = 3
+      } else if (!this.#rebuilding) {
+        void this.#rebuildAsync(renderer, set, maps, buffers)
+      } else {
+        // A build is already running against older state. Ask again next frame
+        // rather than starting a second one alongside it.
+        this.#needsRebuild = true
+      }
     }
+    if (!this.#material) return false
     if (!this.#needsComposite && this.#rebuildDraws === 0) return false
 
     // The frozen lower stack is re-rendered while the pipeline is still
@@ -183,10 +235,19 @@ export class Compositor {
     return true
   }
 
-  #rebuild(set: TextureSetState, maps: MeshMaps, buffers: Map<string, PaintBuffer>): void {
-    this.#material?.dispose()
-    this.#belowMaterial?.dispose()
-    this.#belowMaterial = null
+  /**
+   * Builds the replacement graph *without* touching anything currently live.
+   *
+   * Keeping this free of side effects is what makes the asynchronous path
+   * possible at all: the result can be thrown away if it is superseded, and
+   * the shader on screen is unaffected until `#applyBuild` swaps it in.
+   */
+  #buildGraph(
+    set: TextureSetState,
+    maps: MeshMaps,
+    buffers: Map<string, PaintBuffer>,
+  ): { material: MeshBasicNodeMaterial; belowMaterial: MeshBasicNodeMaterial | null } {
+    let belowMaterial: MeshBasicNodeMaterial | null = null
     const material = new MeshBasicNodeMaterial()
     material.depthTest = false
     material.depthWrite = false
@@ -215,7 +276,6 @@ export class Compositor {
       belowMaterial.blending = NoBlending
       const frozen = this.#evalStack(set.layers.slice(0, split), defaultBundle(), ctx)
       belowMaterial.fragmentNode = mrt(packBundle({ ...frozen, normal: normalize(frozen.normal) }))
-      this.#belowMaterial = belowMaterial
       base = unpackSlots(below.rt.textures, uvNode)
       layers = set.layers.slice(split)
     }
@@ -225,7 +285,95 @@ export class Compositor {
     // RNM and with plain lerps, and neither preserves magnitude.
     const normalised: ChannelBundle = { ...result, normal: normalize(result.normal) }
     material.fragmentNode = mrt(packBundle(normalised))
-    this.#material = material
+    return { material, belowMaterial }
+  }
+
+  /** Retires the live graph and puts a freshly built one in its place. */
+  #applyBuild(built: { material: MeshBasicNodeMaterial; belowMaterial: MeshBasicNodeMaterial | null }): void {
+    this.#material?.dispose()
+    this.#belowMaterial?.dispose()
+    this.#material = built.material
+    this.#belowMaterial = built.belowMaterial
+    this.#belowValid = false
+    this.#needsComposite = true
+  }
+
+  /**
+   * The normal path: build off the frame, compile off the frame, then swap.
+   *
+   * The compile is what actually costs - and `compileAsync` is not merely a
+   * promise wrapper around the synchronous version. It generates the WGSL and
+   * creates the pipeline in chunks, yielding to the event loop between them, so
+   * a several-hundred-millisecond compile never becomes a several-hundred-
+   * millisecond frame. The whole point of doing it here rather than letting the
+   * first draw trigger it is that the first draw cannot yield.
+   */
+  async #rebuildAsync(
+    renderer: Renderer,
+    set: TextureSetState,
+    maps: MeshMaps,
+    buffers: Map<string, PaintBuffer>,
+  ): Promise<void> {
+    const token = ++this.#buildToken
+    this.#rebuilding = true
+    let built: { material: MeshBasicNodeMaterial; belowMaterial: MeshBasicNodeMaterial | null } | null = null
+    try {
+      // Let the frame that asked for this finish and present first.
+      await yieldToBrowser()
+      if (token !== this.#buildToken) return
+
+      built = this.#buildGraph(set, maps, buffers)
+      // Checked again here: an immediate invalidation during the build means
+      // the textures this graph samples may already be gone, and there is no
+      // point handing them to the driver.
+      if (token !== this.#buildToken) return
+      await this.#precompile(renderer, built.material, this.output.rt)
+      if (built.belowMaterial && this.#below) {
+        await this.#precompile(renderer, built.belowMaterial, this.#below.rt)
+      }
+      if (token !== this.#buildToken) return
+
+      this.#applyBuild(built)
+      built = null
+      // The pipeline is already compiled, so this draw will not be skipped -
+      // but a spare costs one fullscreen pass and a missed one costs a black
+      // texture set until the next edit.
+      this.#rebuildDraws = 2
+    } catch (cause) {
+      console.warn('[vibe-painter] deferred composite rebuild failed, retrying inline', cause)
+      // Fall back to the inline path, which cannot be skipped or superseded.
+      this.#rebuildImmediate = true
+      this.#needsRebuild = true
+      this.#needsComposite = true
+    } finally {
+      built?.material.dispose()
+      built?.belowMaterial?.dispose()
+      this.#rebuilding = false
+    }
+  }
+
+  /**
+   * Creates the pipeline for `material` against `target`'s attachment formats.
+   *
+   * The render target is bound only across `compileAsync`'s *synchronous*
+   * prologue - it reads the bound target there and captures a render context -
+   * and restored before the first await. Holding it bound across the await
+   * would mean any frame that landed mid-compile drew the viewport into the
+   * composite target instead of the canvas.
+   */
+  async #precompile(renderer: Renderer, material: MeshBasicNodeMaterial, target: SlotTargets['rt']): Promise<void> {
+    const previous = renderer.getRenderTarget()
+    this.#quadScene.add(this.#quad)
+    this.#quad.material = material
+    let compiled: Promise<void>
+    try {
+      renderer.setRenderTarget(target)
+      compiled = renderer.compileAsync(this.#quadScene, this.#quad.camera)
+    } finally {
+      renderer.setRenderTarget(previous)
+      this.#quadScene.remove(this.#quad)
+    }
+    await compiled
   }
 
   /** Bottom-up walk. `base` is what this stack composites on top of. */
@@ -322,6 +470,8 @@ export class Compositor {
   }
 
   dispose(): void {
+    // Any build still in flight will find its token stale and drop its result.
+    this.#buildToken++
     this.#material?.dispose()
     this.#belowMaterial?.dispose()
     this.#below?.dispose()
