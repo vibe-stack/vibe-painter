@@ -40,8 +40,14 @@ export function packBundle(bundle: ChannelBundle): Record<string, V4> {
 }
 
 /** Slot textures -> bundle, for reading a paint layer or the composite back. */
-export function unpackSlots(textures: readonly Texture[], uvNode: V2): ChannelBundle {
-  const samples = textures.map((tex) => texture(tex, uvNode))
+export function unpackSlots(textures: readonly Texture[], uvNode: V2, texelCoord: V2 | null = null): ChannelBundle {
+  // `texelCoord` switches these reads to `textureLoad`, which needs no sampler.
+  // WebGPU caps samplers at 16 per shader stage and that cap is hardware, not a
+  // default that can be raised - so a compositor that sampled five textures per
+  // paint layer ran out of samplers at the third layer. A 1:1 fullscreen pass
+  // over same-sized targets is reading texel centres anyway, so there is
+  // nothing for a sampler to interpolate.
+  const samples = textures.map((tex) => (texelCoord ? texture(tex).load(texelCoord) : texture(tex, uvNode)))
   const bundle = defaultBundle()
 
   for (const info of CHANNEL_LIST) {

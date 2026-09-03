@@ -28,8 +28,10 @@ const KERNEL_SUM = 16
  * `radius` is a node so mask blur stays a slider rather than a recompile; pass
  * `null` to skip the taps entirely, which is what an unblurred mask does.
  */
-export function blurredCoverage(tex: Texture, uvNode: V2, radius: F | null): F {
-  if (!radius) return texture(tex, uvNode).x
+export function blurredCoverage(tex: Texture, uvNode: V2, radius: F | null, texelCoord: V2 | null = null): F {
+  // Unblurred coverage is one texel fetch, so it can skip the sampler; see
+  // `unpackSlots`. A blurred mask still interpolates and keeps sampling.
+  if (!radius) return texelCoord ? texture(tex).load(texelCoord).x : texture(tex, uvNode).x
 
   let sum: F = float(0)
   for (const [dx, dy, weight] of KERNEL) {

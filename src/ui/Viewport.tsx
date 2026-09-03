@@ -31,6 +31,36 @@ interface ViewportProps {
   onPaintBlocked: (reason: string) => void
 }
 
+/**
+ * Raises the per-stage texture limits to whatever the adapter actually offers.
+ *
+ * WebGPU's *default* limit is 16 sampled textures per shader stage, and it is a
+ * default, not a capability - this machine's adapter allows 48. The compositor
+ * is one shader over the whole layer stack, and every paint layer in it costs
+ * five textures (four channel slots plus its coverage mask). So the third paint
+ * layer pushed the fragment stage to 17, pipeline creation failed with a
+ * validation error, and the layer simply did nothing: no crash, no missing
+ * pixels, just a layer that quietly refused to exist.
+ *
+ * Requesting only the two limits that bind, and only as much as the adapter
+ * reports, keeps this honest - asking for more than the hardware has would fail
+ * the device request outright.
+ */
+async function textureLimits(): Promise<Record<string, number> | undefined> {
+  try {
+    const adapter = await navigator.gpu?.requestAdapter()
+    if (!adapter) return undefined
+    return {
+      maxSampledTexturesPerShaderStage: adapter.limits.maxSampledTexturesPerShaderStage,
+      maxSamplersPerShaderStage: adapter.limits.maxSamplersPerShaderStage,
+    }
+  } catch {
+    // No adapter to ask, or a backend without WebGPU limits at all (the WebGL
+    // fallback). The defaults still render; they just cap the layer count.
+    return undefined
+  }
+}
+
 export function Viewport(props: ViewportProps) {
   const api = useApi()
   return (
@@ -48,6 +78,7 @@ export function Viewport(props: ViewportProps) {
           canvas: defaults.canvas as HTMLCanvasElement,
           antialias: true,
           alpha: false,
+          requiredLimits: await textureLimits(),
         })
         await renderer.init()
         renderer.toneMapping = ACESFilmicToneMapping

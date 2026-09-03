@@ -33,7 +33,7 @@
 
 import { MeshBasicNodeMaterial, NoBlending, QuadMesh, Scene } from 'three/webgpu'
 import type { Renderer } from 'three/webgpu'
-import { float, mix, mrt, normalize, uv, vec3 } from 'three/tsl'
+import { float, ivec2, mix, mrt, normalize, uv, vec3 } from 'three/tsl'
 import { CHANNEL_LIST } from '../channels'
 import type { LayerState, TextureSetState } from '../doc/types'
 import { channelSettings } from '../doc/document'
@@ -56,6 +56,8 @@ import { yieldToBrowser } from './scheduler'
 
 interface BuildContext {
   uv: V2
+  /** Integer texel coordinate for sampler-free reads. See `unpackSlots`. */
+  coord: V2
   texel: F
   maps: MeshMaps
   mapNodes: ReturnType<MeshMaps['nodes']>
@@ -256,6 +258,7 @@ export class Compositor {
     const uvNode = uv()
     const ctx: BuildContext = {
       uv: uvNode,
+      coord: ivec2(uvNode.mul(set.resolution)) as unknown as V2,
       texel: float(1 / Math.max(1, set.resolution)),
       maps,
       mapNodes: maps.nodes(uvNode),
@@ -270,20 +273,34 @@ export class Compositor {
     let layers = set.layers
     if (split > 0) {
       const below = this.#ensureBelow(set.resolution)
-      const belowMaterial = new MeshBasicNodeMaterial()
+      // Assigns the result variable - declaring a second `belowMaterial` here
+      // shadowed it, so this returned null while the main graph below still
+      // read the frozen cache. Nothing ever rendered into that cache, so the
+      // stack composited on top of zeros: a zero normal, `normalize()`, NaN,
+      // and a pitch-black model with every other channel still correct.
+      belowMaterial = new MeshBasicNodeMaterial()
       belowMaterial.depthTest = false
       belowMaterial.depthWrite = false
       belowMaterial.blending = NoBlending
       const frozen = this.#evalStack(set.layers.slice(0, split), defaultBundle(), ctx)
       belowMaterial.fragmentNode = mrt(packBundle({ ...frozen, normal: normalize(frozen.normal) }))
-      base = unpackSlots(below.rt.textures, uvNode)
+      base = unpackSlots(below.rt.textures, uvNode, ctx.coord)
       layers = set.layers.slice(split)
     }
 
     const result = this.#evalStack(layers, base, ctx)
     // Normals must leave the compositor unit length: layers blend them with
     // RNM and with plain lerps, and neither preserves magnitude.
-    const normalised: ChannelBundle = { ...result, normal: normalize(result.normal) }
+    //
+    // Guarded rather than a bare `normalize`, because the cost of getting a
+    // zero here is out of all proportion to the odds of it: NaN across the
+    // normal channel renders the whole model black while every other channel
+    // still reads correct, which is a miserable thing to debug.
+    const normalLength = result.normal.length()
+    const normalised: ChannelBundle = {
+      ...result,
+      normal: normalLength.greaterThan(float(1e-5)).select(result.normal.div(normalLength), vec3(0, 0, 1)),
+    }
     material.fragmentNode = mrt(packBundle(normalised))
     return { material, belowMaterial }
   }
@@ -414,7 +431,7 @@ export class Compositor {
       } else {
         const buffer = ctx.buffers.get(layer.paintBufferId)
         if (buffer?.slots) {
-          src = unpackSlots(buffer.slots.rt.textures, ctx.uv)
+          src = unpackSlots(buffer.slots.rt.textures, ctx.uv, ctx.coord)
           // Painted pixels only exist where the brush actually landed.
           amount = amount.mul(coverageOf(buffer, ctx))
         }
@@ -482,7 +499,7 @@ export class Compositor {
 // ---------------------------------------------------------------------------
 
 function coverageOf(buffer: PaintBuffer, ctx: BuildContext): F {
-  return blurredCoverage(buffer.coverage.texture, ctx.uv, null)
+  return blurredCoverage(buffer.coverage.texture, ctx.uv, null, ctx.coord)
 }
 
 /** Whether `id` is `layer` or lives anywhere inside it. */
