@@ -62,6 +62,15 @@ export function BakeSection() {
 
       <ParamGroupLabel>Settings</ParamGroupLabel>
       <Slider
+        label="Resolution"
+        hint="Mesh maps feed masks rather than detail, and tracing cost is quadratic in this — 512 is usually plenty. Capped to the texture set's resolution."
+        value={settings.resolution}
+        min={128}
+        max={2048}
+        step={128}
+        onChange={(resolution) => patch({ resolution: Math.round(resolution) })}
+      />
+      <Slider
         label="AO Rays"
         hint="Rays traced per texel. Noise falls as the square root of this, so doubling it halves the grain — and doubles the bake."
         value={settings.aoRays}

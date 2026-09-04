@@ -156,9 +156,11 @@ export interface MeshMapsState {
 
 export interface BakeSettings {
   /**
-   * @deprecated The maps bake at the texture set's resolution, and AO traces
-   * the mesh rather than gathering from depth maps, so there is nothing left
-   * for this to size. Kept so saved projects still deserialise.
+   * Resolution the mesh maps bake at, capped to the texture set's.
+   *
+   * Tracing cost is quadratic in this, so it is the main speed control. Mesh
+   * maps feed masks rather than detail, and the result is dilated and sampled
+   * bilinearly, so it upscales without showing.
    */
   resolution: number
   /** Rays per texel for AO. Rounded up to a multiple of the pass size. */
@@ -243,7 +245,7 @@ export const DEFAULT_PROJECTION: ProjectionSettings = {
  * of it for when quality matters more than the wait.
  */
 export const DEFAULT_BAKE_SETTINGS: BakeSettings = {
-  resolution: 1024,
+  resolution: 512,
   aoRays: 64,
   aoDistance: 0.5,
   thicknessRays: 12,

@@ -45,6 +45,8 @@ const BUFFER_WIDTH = 2048
 export class BvhTextures {
   readonly nodes: DataTexture
   readonly triangles: DataTexture
+  readonly nodeCount: number
+  readonly triangleCount: number
 
   #nodeCount = uniform(0, 'int')
   /**
@@ -57,6 +59,8 @@ export class BvhTextures {
   constructor(packed: PackedBvh) {
     this.nodes = createBuffer(packed.nodes, packed.nodeCount * 2)
     this.triangles = createBuffer(packed.triangles, packed.triangleCount * 3)
+    this.nodeCount = packed.nodeCount
+    this.triangleCount = packed.triangleCount
     this.#nodeCount.value = packed.nodeCount
     this.#stepLimit.value = packed.nodeCount + 1
   }
@@ -153,6 +157,22 @@ export class BvhTextures {
     })
 
     return vec4(found, closest, 0, 0)
+  }).setLayout({
+    // An explicit layout, so this compiles to a real WGSL function instead of
+    // being inlined at each call site. It is called twice per ray - once
+    // outward for occlusion, once inward for thickness - and inlining a body
+    // that declares its own loop counters and mutable state twice into one
+    // scope is a class of bug that cannot be reasoned about from the outside.
+    // A function call has none of that ambiguity, and the traversal is far too
+    // large to want duplicated anyway.
+    name: 'traceBvh',
+    type: 'vec4',
+    inputs: [
+      { name: 'origin', type: 'vec3' },
+      { name: 'dir', type: 'vec3' },
+      { name: 'tMin', type: 'float' },
+      { name: 'tMax', type: 'float' },
+    ],
   })
 
   dispose(): void {

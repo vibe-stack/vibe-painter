@@ -96,14 +96,29 @@ import type { MeshMaps } from './meshmaps'
 import type { F, V2, V3, V4 } from './nodes'
 
 /**
- * Rays per draw. Small enough that no single draw can trip a GPU watchdog on a
- * large atlas, large enough that the per-pass overhead - re-rasterising the
- * mesh and re-reading the accumulator - stays amortised.
+ * Fragment-rays a single draw may issue.
+ *
+ * Tracing is not cheap per ray - a walk visits tens of nodes and each visit is
+ * a texture fetch - so the size of one draw has to be bounded by the *product*
+ * of resolution and rays, not by a fixed ray count. A 2k atlas at eight rays a
+ * texel is on the order of a billion loop iterations in one draw, which is well
+ * past what a browser will wait for: the GPU work is killed part way, and on a
+ * tile-based GPU that surfaces as rectangular blocks of whatever was in that
+ * memory rather than as an error.
  */
-const RAYS_PER_PASS = 8
+const PASS_BUDGET = 1_500_000
 
 /** Thickness is far lower frequency than AO, so it does not need the budget. */
 const MAX_THICKNESS_RAYS = 32
+
+/**
+ * Mesh maps are low frequency - they feed masks, not detail - and the bake cost
+ * is quadratic in this, so the default is well below a typical texture set. The
+ * result is dilated and sampled bilinearly, so it upscales cleanly.
+ */
+function bakeResolution(setting: number, textureSet: number): number {
+  return Math.max(64, Math.min(textureSet, Math.round(setting)))
+}
 
 export class GpuMeshMapBaker {
   #uvPass = new UVSpacePass()
@@ -129,6 +144,8 @@ export class GpuMeshMapBaker {
   #aoRayTotal = uniform(64)
   #thicknessRayTotal = uniform(32)
   #passIndex = uniform(0)
+  #raysPerPass = uniform(0, 'int')
+  #raysPerPassScale = uniform(0)
 
   cancel(): void {
     this.#cancelled = true
@@ -143,16 +160,17 @@ export class GpuMeshMapBaker {
   ): Promise<void> {
     this.#cancelled = false
 
-    const resolution = maps.resolution
+    const resolution = bakeResolution(settings.resolution, maps.resolution)
     maps.ensureRayTarget(resolution)
 
     if (!geometry.boundingBox) geometry.computeBoundingBox()
     const box = geometry.boundingBox!
     const radius = Math.max(1e-5, box.max.clone().sub(box.min).length() * 0.5)
 
-    const aoRays = Math.max(RAYS_PER_PASS, Math.min(512, Math.round(settings.aoRays)))
-    const passes = Math.ceil(aoRays / RAYS_PER_PASS)
-    const thicknessRays = Math.min(MAX_THICKNESS_RAYS, passes * RAYS_PER_PASS)
+    const raysPerPass = Math.max(1, Math.min(16, Math.round(PASS_BUDGET / (resolution * resolution))))
+    const aoRays = Math.max(raysPerPass, Math.min(512, Math.round(settings.aoRays)))
+    const passes = Math.ceil(aoRays / raysPerPass)
+    const thicknessRays = Math.min(MAX_THICKNESS_RAYS, passes * raysPerPass)
 
     this.#aoDistance.value = Math.max(1e-4, settings.aoDistance * radius)
     this.#thicknessDistance.value = Math.max(1e-4, settings.thicknessDistance * radius * 2)
@@ -161,8 +179,10 @@ export class GpuMeshMapBaker {
     // this replaces, which is why fine creases survive now.
     this.#originBias.value = Math.max(settings.rayBias * radius, 1e-6)
     this.#curvatureIntensity.value = settings.curvatureIntensity
-    this.#aoRayTotal.value = passes * RAYS_PER_PASS
+    this.#aoRayTotal.value = passes * raysPerPass
     this.#thicknessRayTotal.value = thicknessRays
+    this.#raysPerPass.value = raysPerPass
+    this.#raysPerPassScale.value = raysPerPass
 
     onProgress?.({ fraction: 0.02, message: 'Measuring curvature' })
     ensureVertexCurvature(geometry, settings.curvatureRadius)
@@ -193,7 +213,7 @@ export class GpuMeshMapBaker {
         this.#uvPass.render(renderer, geometry, this.#traceMaterial!, accum, false)
         onProgress?.({
           fraction: 0.12 + (0.8 * (pass + 1)) / passes,
-          message: `Tracing ${(pass + 1) * RAYS_PER_PASS}/${passes * RAYS_PER_PASS} rays`,
+          message: `Tracing ${(pass + 1) * raysPerPass}/${passes * raysPerPass} rays`,
         })
         // Hand the frame back so the page stays alive and the progress bar
         // actually moves; a bake of a dense mesh is seconds of GPU time.
@@ -245,8 +265,8 @@ export class GpuMeshMapBaker {
       const outwardOrigin = P.add(N.mul(this.#originBias))
       const inwardOrigin = P.sub(N.mul(this.#originBias))
 
-      Loop({ start: int(0), end: int(RAYS_PER_PASS), type: 'int', condition: '<' }, ({ i }) => {
-        const index = float(i).add(this.#passIndex.mul(float(RAYS_PER_PASS)))
+      Loop({ start: int(0), end: this.#raysPerPass, type: 'int', condition: '<' }, ({ i }) => {
+        const index = float(i).add(this.#passIndex.mul(this.#raysPerPassScale))
 
         // Cosine weighted and stratified. The elevation is a stratum of the ray
         // budget so no two rays crowd the same ring, and the azimuth advances

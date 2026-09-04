@@ -148,26 +148,31 @@ export class Dilator {
     }
   }
 
-  /** Grows AO / curvature / thickness into the UV gutter. */
+  /**
+   * Grows AO / curvature / thickness into the UV gutter.
+   *
+   * No island mask here, unlike paint. The mask lives at the texture set's
+   * resolution while the mesh maps bake at their own - tracing is quadratic in
+   * that, so they are usually smaller - and a mask sampled at the wrong scale
+   * answers "is this texel surface?" a texel out at every chart border. That
+   * gate would then refuse to pad exactly the texels that most need it, leaving
+   * an undilated rim tracing every island. The ray map carries its own coverage
+   * in alpha, written by the same raster that produced its values, so it is
+   * both authoritative and at the right resolution by construction.
+   */
   dilateRay(renderer: Renderer, maps: MeshMaps, iterations: number): void {
     if (iterations <= 0 || !maps.rayBaked) return
     const res = maps.ray.width
     this.#texelSize.value.set(1 / res, 1 / res)
     const scratch = this.#ensureRayScratch(res)
-    const key = `ray:${maps.ray.texture.id}:${maps.islandMask.texture.id}`
+    const key = `ray:${maps.ray.texture.id}`
     if (!this.#rayMaterial || this.#sourceKey !== key) {
       this.#rayMaterial?.dispose()
       const material = new MeshBasicNodeMaterial()
       material.depthTest = false
       material.depthWrite = false
       material.blending = NoBlending
-      const { outputs } = dilateNode(
-        [maps.ray.texture],
-        maps.ray.texture,
-        'w',
-        this.#texelSize,
-        maps.islandMask.texture,
-      )
+      const { outputs } = dilateNode([maps.ray.texture], maps.ray.texture, 'w', this.#texelSize)
       material.fragmentNode = outputs[0]
       this.#rayMaterial = material
       this.#sourceKey = key

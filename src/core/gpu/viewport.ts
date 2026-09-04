@@ -93,6 +93,7 @@ export class ViewportMaterials {
     const uvNode = uv()
     this.#texel.value.set(1 / slots.resolution, 1 / slots.resolution)
     const bundle = unpackSlots(slots.rt.textures, uvNode)
+    const mapNodes = maps.nodes(uvNode)
 
     // --- Shaded ----------------------------------------------------------
     const heightTexture = slots.texture(CHANNEL_INFO.height.slot)
@@ -107,9 +108,20 @@ export class ViewportMaterials {
     this.shaded.colorNode = bundle.baseColor as V3
     this.shaded.roughnessNode = (bundle.roughness as F).clamp(0.015, 1)
     this.shaded.metalnessNode = (bundle.metallic as F).clamp(0, 1)
+    // Painted occlusion times baked occlusion, the way Substance combines them.
+    // The two answer different questions - the channel is what was painted into
+    // the texture set, the mesh map is what the shape itself occludes - and
+    // multiplying is what makes baking visible in the viewport rather than only
+    // to generators. It stays out of the exported `ao` channel, which is the
+    // painted one: a mesh map is a source, not a channel.
+    //
+    // `aoNode` attenuates indirect light only, so this darkens cavities under
+    // the environment without dimming direct lights. Before a bake the mesh AO
+    // is a constant 1 and this is exactly what it was.
+    //
     // Uncleared composite targets are 0. AO of 0 kills IBL; a 0 tangent
     // normal normalises to NaN and kills direct lighting too.
-    this.shaded.aoNode = (bundle.ao as F).max(0.04).clamp(0, 1)
+    this.shaded.aoNode = (bundle.ao as F).mul(mapNodes.ao).max(0.04).clamp(0, 1)
     this.shaded.emissiveNode = bundle.emissive as V3
     // Compositor stores tangent-space normals. TBN * n is the correct
     // transform; `transformNormalToView` is object-space and flattened the
@@ -130,7 +142,6 @@ export class ViewportMaterials {
     this.shaded.needsUpdate = true
 
     // --- Debug / channel solo -------------------------------------------
-    const mapNodes = maps.nodes(uvNode)
     const options: { mode: ViewMode; value: V3 }[] = [
       { mode: 'baseColor', value: bundle.baseColor as V3 },
       { mode: 'roughness', value: vec3(bundle.roughness as F) },

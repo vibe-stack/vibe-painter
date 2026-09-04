@@ -108,10 +108,27 @@ export class MeshMaps {
     )
   }
 
+  /**
+   * Resizes the ray maps, *keeping the same texture object*.
+   *
+   * This used to dispose the target and build a new one, and that is a live
+   * grenade: the compositor's shader graph holds a node bound to this exact
+   * `Texture`, and it goes on holding it until the graph is rebuilt - which
+   * only happens once the bake finishes. Disposing here destroys the GPU
+   * resource out from under a graph that is still rendering the viewport every
+   * frame. The next frame samples a destroyed texture, WebGPU rejects the
+   * command buffer, and *everything else encoded alongside it dies with it* -
+   * including the bake's own passes, which then write nothing at all.
+   *
+   * It only bites when the resolution actually changes, so the bake looks fine
+   * until someone moves the slider and then produces an empty map with a
+   * validation error. `setSize` keeps the object and lets three re-upload
+   * behind it, which is what the geometry maps and island mask have always
+   * done two lines up.
+   */
   ensureRayTarget(resolution: number): void {
     if (this.#ray.width === resolution) return
-    this.#ray.dispose()
-    this.#ray = createRayTarget(resolution)
+    this.#ray.setSize(resolution, resolution)
     this.#rayBaked = false
   }
 

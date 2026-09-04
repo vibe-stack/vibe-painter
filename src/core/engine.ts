@@ -444,6 +444,13 @@ export class Engine {
     this.#baking = true
     try {
       if (!this.#meshMaps.geometryBaked) this.#bakeGeometry({ silent: true })
+      // Take the ray maps out of the live graph for the duration. The bake
+      // renders into them across many frames, and a viewport that goes on
+      // sampling a target it is being written into is at best reading torn
+      // intermediate state. Generators fall back to neutral values while this
+      // runs, and the rebuild below puts the finished maps back.
+      this.#meshMaps.clearRayMaps()
+      this.#compositor.invalidateGraph({ immediate: true })
       await this.#meshMapBaker.bake(renderer, geometry, this.#meshMaps, merged, (progress) => {
         this.events.emit('bakeProgress', progress)
       })
