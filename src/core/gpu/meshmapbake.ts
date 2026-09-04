@@ -1,377 +1,503 @@
 /**
- * AO, curvature and thickness on the GPU.
+ * AO, curvature and thickness.
  *
- * Curvature is a derivative of the world normal, rasterised into UV space
- * with the same pass the geometry maps use — so it cannot pick up chart
- * borders.
+ * Every pass here rasterises the *mesh* into UV space. That is the whole design
+ * and it is what fixes the jagged lines that used to trace every UV chart in
+ * all three maps at once.
  *
- * AO and thickness are visibility. A gather in the atlas follows UV seams
- * (the cracked "AO" on the bust). Instead the mesh is rendered from a
- * Fibonacci set of directions into a depth buffer, and each surface texel
- * asks whether anything sits in front of it along that ray. That is a
- * directional shadow map, accumulated over the hemisphere.
+ * The old passes were fullscreen quads that read the baked geometry maps and
+ * gated on the island mask - two separate answers to "is this texel surface?",
+ * reached by two different paths, which is one answer too many. Wherever they
+ * disagreed by a texel the compose pass wrote nothing, and the texel kept the
+ * value it had been cleared to: AO 1, thickness 1, curvature 0. That is exactly
+ * the signature those seams had - white in AO, white in thickness, hard concave
+ * in curvature - and no amount of tuning the visibility maths could have
+ * touched it, because it was never a visibility bug.
+ *
+ * Rasterising the mesh removes the second answer. A texel is written if and
+ * only if the mesh covers it, by the same rasteriser that defines the island in
+ * the first place, and the fragment carries its own position and normal as
+ * full-precision varyings instead of reading them back out of a half-float map.
+ *
+ * What the passes compute:
+ *
+ *  - **AO and thickness** trace real rays against a BVH (`raytrace.ts`). The
+ *    previous version gathered from 512-1024px depth maps rendered from a
+ *    sphere of directions, which cannot resolve an occluder smaller than its
+ *    own texel - an eyelid crease baked to nothing - and which is a stack of
+ *    hard directional shadows rather than an integrated hemisphere, hence the
+ *    patchwork. Cosine-weighted stratified rays give the smooth result the
+ *    technique was reaching for.
+ *  - **Curvature** is measured on the mesh's connectivity (`mesh/curvature.ts`)
+ *    and arrives as a vertex attribute, so this file only interpolates it.
+ *
+ * The ray budget is split across several draws with a yield between them: one
+ * draw covering a 2k atlas at 128 rays a texel is long enough for a browser to
+ * decide the GPU has hung.
+ *
+ * Those draws accumulate through *blending* rather than by reading back the
+ * previous pass's target. A ping-pong makes every pass a read of the texture
+ * the pass before it just rendered into, and that hazard is the one thing here
+ * with no cheap way to verify from the outside - it showed up as speckle in AO
+ * and tile-shaped blocks in thickness. Blending keeps the sum entirely inside
+ * the attachment, where the ordering is the API's problem rather than ours, and
+ * it costs one render target instead of two.
  */
 
 import {
-  Mesh,
+  AddEquation,
+  CustomBlending,
+  DoubleSide,
   MeshBasicNodeMaterial,
-  Matrix4,
+  NearestFilter,
   NoBlending,
   NodeMaterial,
-  OrthographicCamera,
+  OneFactor,
   QuadMesh,
-  Scene,
-  Vector3,
+  RGBAFormat,
   RenderTarget,
+  Scene,
 } from 'three/webgpu'
 import type { BufferGeometry, Renderer } from 'three/webgpu'
 import {
   Fn,
   If,
-  dFdx,
-  dFdy,
+  Loop,
+  abs,
+  attribute,
+  cos,
+  cross,
   float,
+  fract,
+  int,
   max,
-  min,
   modelNormalMatrix,
-  normalize,
   normalLocal,
+  normalize,
   positionWorld,
+  sin,
+  sqrt,
   texture,
   uniform,
   uv,
   vec2,
+  vec3,
   vec4,
 } from 'three/tsl'
 import type { BakeSettings } from '../doc/types'
 import type { BakeProgress } from '../bake/baker'
 import { CHANNEL_TARGET_OPTIONS } from './targets'
-import { UVSpacePass, renderQuad, uvClipPosition } from './uvspace'
-import { createRayTarget } from './meshmaps'
+import { UVSpacePass, compileAgainst, renderQuad, uvClipPosition } from './uvspace'
+import { CURVATURE_ATTRIBUTE, ensureVertexCurvature } from '../mesh/curvature'
+import { Bvh } from '../bake/bvh'
+import { BvhTextures } from './raytrace'
+import { attributeToFloat32 } from '../mesh/attributes'
 import type { MeshMaps } from './meshmaps'
+import type { F, V2, V3, V4 } from './nodes'
 
-const DEPTH_MAP_SIZE = 512
-const FAR_CLEAR = 1e5
+/**
+ * Rays per draw. Small enough that no single draw can trip a GPU watchdog on a
+ * large atlas, large enough that the per-pass overhead - re-rasterising the
+ * mesh and re-reading the accumulator - stays amortised.
+ */
+const RAYS_PER_PASS = 8
+
+/** Thickness is far lower frequency than AO, so it does not need the budget. */
+const MAX_THICKNESS_RAYS = 32
 
 export class GpuMeshMapBaker {
   #uvPass = new UVSpacePass()
   #quad = new QuadMesh()
+  /** Host scene, used only to hand the quad to `compileAsync`. */
+  #quadScene = new Scene()
 
-  #depthScene = new Scene()
-  #depthMesh = new Mesh()
-  #depthCamera = new OrthographicCamera()
-  #depthRT: RenderTarget | null = null
-  #accumA: RenderTarget | null = null
-  #accumB: RenderTarget | null = null
+  #accum: RenderTarget | null = null
 
-  #curvatureMaterial: NodeMaterial | null = null
-  #depthMaterial: NodeMaterial | null = null
-  #farClearMaterial: MeshBasicNodeMaterial | null = null
-  #accumReadA: MeshBasicNodeMaterial | null = null
-  #accumReadB: MeshBasicNodeMaterial | null = null
-  #composeReadA: MeshBasicNodeMaterial | null = null
-  #composeReadB: MeshBasicNodeMaterial | null = null
-  #mapsKey = ''
+  #bvh: BvhTextures | null = null
+  #bvhKey = ''
+
+  #traceMaterial: NodeMaterial | null = null
+  #composeMaterial: NodeMaterial | null = null
+  #zeroMaterial: MeshBasicNodeMaterial | null = null
+  #materialKey = ''
   #cancelled = false
 
   #aoDistance = uniform(0.5)
-  #rayBias = uniform(1e-3)
+  #thicknessDistance = uniform(1)
+  #originBias = uniform(1e-4)
   #curvatureIntensity = uniform(1)
-  #bboxMin = uniform(new Vector3())
-  #bboxSize = uniform(new Vector3())
-  #viewProj = uniform(new Matrix4())
-  #camPos = uniform(new Vector3())
-  #lookDir = uniform(new Vector3())
-  #sampleDir = uniform(new Vector3())
-
-  constructor() {
-    this.#depthMesh.frustumCulled = false
-    this.#depthScene.add(this.#depthMesh)
-  }
+  #aoRayTotal = uniform(64)
+  #thicknessRayTotal = uniform(32)
+  #passIndex = uniform(0)
 
   cancel(): void {
     this.#cancelled = true
   }
 
-  bake(
+  async bake(
     renderer: Renderer,
     geometry: BufferGeometry,
     maps: MeshMaps,
     settings: BakeSettings,
     onProgress?: (progress: BakeProgress) => void,
-  ): void {
-    if (!maps.geometryBaked) throw new Error('Geometry maps must be baked before mesh maps')
+  ): Promise<void> {
     this.#cancelled = false
 
-    maps.ensureRayTarget(settings.resolution)
-    const box = maps.bbox
-    const extent = box.max.clone().sub(box.min)
-    const center = box.min.clone().add(box.max).multiplyScalar(0.5)
-    const radius = Math.max(1e-5, extent.length() * 0.5)
+    const resolution = maps.resolution
+    maps.ensureRayTarget(resolution)
+
+    if (!geometry.boundingBox) geometry.computeBoundingBox()
+    const box = geometry.boundingBox!
+    const radius = Math.max(1e-5, box.max.clone().sub(box.min).length() * 0.5)
+
+    const aoRays = Math.max(RAYS_PER_PASS, Math.min(512, Math.round(settings.aoRays)))
+    const passes = Math.ceil(aoRays / RAYS_PER_PASS)
+    const thicknessRays = Math.min(MAX_THICKNESS_RAYS, passes * RAYS_PER_PASS)
 
     this.#aoDistance.value = Math.max(1e-4, settings.aoDistance * radius)
-    this.#rayBias.value = Math.max(1e-5, settings.rayBias * radius)
+    this.#thicknessDistance.value = Math.max(1e-4, settings.thicknessDistance * radius * 2)
+    // Tracing the real surface needs only enough offset to clear float error on
+    // the originating triangle - orders of magnitude below the depth-map bias
+    // this replaces, which is why fine creases survive now.
+    this.#originBias.value = Math.max(settings.rayBias * radius, 1e-6)
     this.#curvatureIntensity.value = settings.curvatureIntensity
-    this.#bboxMin.value.copy(box.min)
-    this.#bboxSize.value.set(Math.max(1e-5, extent.x), Math.max(1e-5, extent.y), Math.max(1e-5, extent.z))
+    this.#aoRayTotal.value = passes * RAYS_PER_PASS
+    this.#thicknessRayTotal.value = thicknessRays
 
-    const directions = fibonacciSphere(Math.max(8, Math.min(64, Math.round(settings.aoRays))))
-    const accumA = this.#ensureAccum(settings.resolution)
-    const accumB = this.#ensureAccumB(settings.resolution)
-    const depthRT = this.#ensureDepth()
-    this.#prepareMaterials(maps, depthRT, accumA, accumB)
-
-    onProgress?.({ fraction: 0.05, message: 'Rasterising curvature' })
-    this.#bakeCurvature(renderer, geometry, accumA)
-
-    const depthMat = this.#depthMaterialFor()
-    this.#depthMesh.geometry = geometry
-    this.#depthMesh.material = depthMat
-
-    let readA = true
-    const n = directions.length
-    for (let i = 0; i < n; i++) {
-      if (this.#cancelled) return
-      const dir = directions[i]
-      this.#setupDepthCamera(dir, center, radius)
-      this.#renderDepth(renderer, depthRT)
-      const accumMat = readA ? this.#accumReadA! : this.#accumReadB!
-      const write = readA ? accumB : accumA
-      renderQuad(renderer, this.#quad, accumMat, write)
-      readA = !readA
-      if (i % 4 === 0) {
-        onProgress?.({ fraction: 0.1 + (0.75 * (i + 1)) / n, message: `Visibility ${i + 1}/${n}` })
-      }
-    }
-
+    onProgress?.({ fraction: 0.02, message: 'Measuring curvature' })
+    ensureVertexCurvature(geometry, settings.curvatureRadius)
     if (this.#cancelled) return
-    onProgress?.({ fraction: 0.92, message: 'Composing maps' })
-    const compose = readA ? this.#composeReadA! : this.#composeReadB!
-    renderQuad(renderer, this.#quad, compose, maps.ray)
-    maps.markRayBaked()
+
+    onProgress?.({ fraction: 0.05, message: 'Building ray acceleration structure' })
+    const bvh = this.#ensureBvh(geometry)
+    if (this.#cancelled) return
+
+    const accum = this.#ensureAccum(resolution)
+    this.#prepareMaterials(bvh, accum)
+
+    try {
+      onProgress?.({ fraction: 0.08, message: 'Preparing pipelines' })
+      await this.#prewarm(renderer, geometry, maps, accum)
+      if (this.#cancelled) return
+
+      // Both targets start empty. The destination matters as much as the
+      // accumulator: its alpha is what tells the dilation pass which texels are
+      // real, so a texel the mesh never covers has to read as empty for the
+      // dilation to flood over it.
+      renderQuad(renderer, this.#quad, this.#zeroMaterialFor(), accum)
+      renderQuad(renderer, this.#quad, this.#zeroMaterialFor(), maps.ray)
+
+      for (let pass = 0; pass < passes; pass++) {
+        if (this.#cancelled) return
+        this.#passIndex.value = pass
+        this.#uvPass.render(renderer, geometry, this.#traceMaterial!, accum, false)
+        onProgress?.({
+          fraction: 0.12 + (0.8 * (pass + 1)) / passes,
+          message: `Tracing ${(pass + 1) * RAYS_PER_PASS}/${passes * RAYS_PER_PASS} rays`,
+        })
+        // Hand the frame back so the page stays alive and the progress bar
+        // actually moves; a bake of a dense mesh is seconds of GPU time.
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      }
+
+      if (this.#cancelled) return
+      onProgress?.({ fraction: 0.95, message: 'Composing maps' })
+      this.#uvPass.render(renderer, geometry, this.#composeMaterial!, maps.ray, false)
+      maps.markRayBaked()
+    } finally {
+      this.#releaseScratch()
+    }
   }
 
-  #bakeCurvature(renderer: Renderer, geometry: BufferGeometry, target: RenderTarget): void {
-    const material = this.#curvatureMaterialFor()
-    this.#uvPass.render(renderer, geometry, material, target, true)
-    this.#uvPass.render(renderer, geometry, material, target, true)
+  // -- passes ---------------------------------------------------------------
+
+  /**
+   * One batch of rays, added to the running total by the blender.
+   *
+   * `One`/`One` with `AddEquation` is the whole accumulation: the pass emits
+   * only what its own rays found and the attachment keeps the sum. Half float
+   * holds it comfortably - the increments are around 1 and the total is at most
+   * the ray count, so the ratio never approaches the ten bits of mantissa.
+   */
+  #buildTraceMaterial(bvh: BvhTextures): NodeMaterial {
+    const material = new NodeMaterial()
+    material.vertexNode = uvClipPosition()
+    material.depthTest = false
+    material.depthWrite = false
+    material.blending = CustomBlending
+    material.blendEquation = AddEquation
+    material.blendSrc = OneFactor
+    material.blendDst = OneFactor
+
+    // Transformed by hand rather than via `normalWorld`, which three flips for
+    // back-facing fragments. In a UV-space pass "back-facing" means "wound
+    // clockwise in the atlas", which says nothing about the surface - it would
+    // invert the hemisphere on whichever islands happen to be mirrored.
+    const N = normalize(modelNormalMatrix.mul(normalLocal)) as V3
+    const P = positionWorld as V3
+
+    material.fragmentNode = Fn(() => {
+      const aoSum = float(0).toVar('aoSum')
+      const thickSum = float(0).toVar('thickSum')
+
+      const frame = orthonormalFrame(N)
+      const rotation = hash(uv() as V2)
+      const outwardOrigin = P.add(N.mul(this.#originBias))
+      const inwardOrigin = P.sub(N.mul(this.#originBias))
+
+      Loop({ start: int(0), end: int(RAYS_PER_PASS), type: 'int', condition: '<' }, ({ i }) => {
+        const index = float(i).add(this.#passIndex.mul(float(RAYS_PER_PASS)))
+
+        // Cosine weighted and stratified. The elevation is a stratum of the ray
+        // budget so no two rays crowd the same ring, and the azimuth advances
+        // by the golden angle from a per-texel offset - so neighbouring texels
+        // sample different azimuths and the residual noise has no structure to
+        // line up along.
+        const u1 = index.add(0.5).div(this.#aoRayTotal)
+        const u2 = fract(index.mul(float(0.6180339887)).add(rotation))
+        const local = cosineHemisphere(u1 as F, u2 as F)
+        const inPlane = frame.tangent.mul(local.x).add(frame.bitangent.mul(local.y))
+
+        const aoDir = inPlane.add(N.mul(local.z)) as V3
+        const aoHit = bvh.trace(outwardOrigin, aoDir, this.#originBias as F, this.#aoDistance as F)
+        // Attenuate by distance: a wall a hair away occludes far more than one
+        // at the edge of the search radius, and a binary test bands visibly
+        // wherever a surface crosses the cutoff.
+        aoSum.addAssign(aoHit.x.mul(float(1).sub(aoHit.y.div(this.#aoDistance)).clamp(0, 1)))
+
+        If(index.lessThan(this.#thicknessRayTotal), () => {
+          // Thickness gets its own stratification rather than reusing the AO
+          // ray's direction. It runs on a smaller budget, and the strata are
+          // ordered - so taking the first N of the AO sequence would take the
+          // first N *elevations*, every one of them hugging the normal. That
+          // measures the depth straight down through the surface, not the mean
+          // over the hemisphere, and a fin would read as solid as a sphere.
+          const t1 = index.add(0.5).div(this.#thicknessRayTotal)
+          const t2 = fract(index.mul(float(0.6180339887)).add(rotation).add(float(0.5)))
+          const inwardLocal = cosineHemisphere(t1 as F, t2 as F)
+          // Mirrored through the surface: straight into the mesh, where the
+          // first hit is the far wall. A miss means the ray left the model
+          // without finding anything within the search distance, which is as
+          // solid as this measurement can report.
+          const inward = frame.tangent.mul(inwardLocal.x)
+            .add(frame.bitangent.mul(inwardLocal.y))
+            .sub(N.mul(inwardLocal.z)) as V3
+          const hit = bvh.trace(inwardOrigin, inward, this.#originBias as F, this.#thicknessDistance as F)
+          const depth = hit.x.greaterThan(float(0)).select(hit.y, this.#thicknessDistance)
+          thickSum.addAssign(depth.div(this.#thicknessDistance).clamp(0, 1))
+        })
+      })
+
+      return vec4(aoSum, thickSum, 0, 0)
+    })()
+    return material
   }
 
-  #prepareMaterials(maps: MeshMaps, depthRT: RenderTarget, accumA: RenderTarget, accumB: RenderTarget): void {
-    const key = `${maps.geometry.textures[0].id}:${maps.islandMask.texture.id}:${depthRT.texture.id}:${accumA.texture.id}:${accumB.texture.id}`
-    if (this.#mapsKey === key && this.#accumReadA && this.#accumReadB) return
-    this.#accumReadA?.dispose()
-    this.#accumReadB?.dispose()
-    this.#composeReadA?.dispose()
-    this.#composeReadB?.dispose()
-    this.#accumReadA = this.#buildAccumMaterial(maps, depthRT, accumA)
-    this.#accumReadB = this.#buildAccumMaterial(maps, depthRT, accumB)
-    this.#composeReadA = this.#buildComposeMaterial(maps, accumA)
-    this.#composeReadB = this.#buildComposeMaterial(maps, accumB)
-    this.#mapsKey = key
-  }
-
-  #curvatureMaterialFor(): NodeMaterial {
-    if (this.#curvatureMaterial) return this.#curvatureMaterial
+  /**
+   * Turns the sums into the maps, and stamps coverage.
+   *
+   * Also a mesh raster rather than a fullscreen quad, so the alpha it writes
+   * marks exactly the texels the mesh covers - the single source of truth the
+   * dilation pass then floods outward from.
+   */
+  #buildComposeMaterial(source: RenderTarget): NodeMaterial {
     const material = new NodeMaterial()
     material.vertexNode = uvClipPosition()
     material.depthTest = false
     material.depthWrite = false
     material.blending = NoBlending
-    const wn = normalize(modelNormalMatrix.mul(normalLocal))
-    const wp = positionWorld
-    const dpx = dFdx(wp)
-    const dpy = dFdy(wp)
-    const dnx = dFdx(wn)
-    const dny = dFdy(wn)
-    const cx = dnx.dot(dpx).div(max(dpx.dot(dpx), float(1e-8)))
-    const cy = dny.dot(dpy).div(max(dpy.dot(dpy), float(1e-8)))
-    const raw = cx.add(cy).mul(0.5).mul(this.#curvatureIntensity)
-    const curv = raw.mul(0.5).add(0.5).clamp(0, 1)
-    material.fragmentNode = vec4(float(0), float(0), float(FAR_CLEAR), curv)
-    this.#curvatureMaterial = material
+
+    const accumulated = texture(source.texture, uv())
+    const ao = float(1).sub(accumulated.x.div(max(this.#aoRayTotal, float(1)))).clamp(0, 1)
+    // Mean ray depth into the mesh, already normalised by the search distance:
+    // 0 where rays exit immediately, 1 where nothing was found within reach.
+    const thickness = accumulated.y.div(max(this.#thicknessRayTotal, float(1))).clamp(0, 1)
+
+    const raw = attribute(CURVATURE_ATTRIBUTE, 'float') as unknown as F
+    const curvature = raw.mul(this.#curvatureIntensity).clamp(-1, 1).mul(0.5).add(0.5)
+
+    material.fragmentNode = vec4(ao, curvature, thickness, 1)
     return material
   }
 
-  #depthMaterialFor(): NodeMaterial {
-    if (this.#depthMaterial) return this.#depthMaterial
-    const material = new NodeMaterial()
-    material.depthTest = true
-    material.depthWrite = true
-    material.blending = NoBlending
-    const linear = positionWorld.sub(this.#camPos).dot(this.#lookDir)
-    material.fragmentNode = vec4(linear, 0, 0, 1)
-    this.#depthMaterial = material
-    return material
-  }
-
-  #farClearMaterialFor(): MeshBasicNodeMaterial {
-    if (this.#farClearMaterial) return this.#farClearMaterial
+  #zeroMaterialFor(): MeshBasicNodeMaterial {
+    if (this.#zeroMaterial) return this.#zeroMaterial
     const material = new MeshBasicNodeMaterial()
     material.depthTest = false
     material.depthWrite = false
     material.blending = NoBlending
-    material.fragmentNode = vec4(FAR_CLEAR, 0, 0, 1)
-    this.#farClearMaterial = material
+    material.fragmentNode = vec4(0, 0, 0, 0) as V4
+    this.#zeroMaterial = material
     return material
   }
 
-  #buildAccumMaterial(maps: MeshMaps, depthRT: RenderTarget, accumSrc: RenderTarget): MeshBasicNodeMaterial {
-    const material = new MeshBasicNodeMaterial()
-    material.depthTest = false
-    material.depthWrite = false
-    material.blending = NoBlending
-    const uvNode = uv()
-    const island = texture(maps.islandMask.texture, uvNode).x
-    const P = texture(maps.geometry.textures[0], uvNode).xyz.mul(this.#bboxSize).add(this.#bboxMin)
-    const N = normalize(texture(maps.geometry.textures[1], uvNode).xyz)
-    const prevTex = accumSrc.texture
-    const depthTex = depthRT.texture
+  // -- resources ------------------------------------------------------------
 
-    material.fragmentNode = Fn(() => {
-      const prev = texture(prevTex, uvNode)
-      const occ = prev.x.toVar('occ')
-      const count = prev.y.toVar('count')
-      const thick = prev.z.toVar('thick')
-      const curv = prev.w.toVar('curv')
+  /**
+   * Builds the BVH, keyed on the geometry so a re-bake of the same mesh reuses
+   * it. On a dense mesh the build is the one part of this that runs on the CPU.
+   */
+  #ensureBvh(geometry: BufferGeometry): BvhTextures {
+    const position = geometry.getAttribute('position')
+    if (!position) throw new Error('Baking needs a position attribute')
+    const key = `${geometry.uuid}:${position.count}:${geometry.getIndex()?.count ?? -1}`
+    if (this.#bvh && this.#bvhKey === key) return this.#bvh
 
-      If(island.greaterThan(float(0.5)), () => {
-        const clip = this.#viewProj.mul(vec4(P, 1))
-        const ndc = clip.xyz.div(clip.w)
-        const suv = vec2(ndc.x.mul(0.5).add(0.5), ndc.y.mul(0.5).add(0.5))
-        const onMap = suv.x.greaterThanEqual(0).and(suv.x.lessThanEqual(1)).and(suv.y.greaterThanEqual(0)).and(suv.y.lessThanEqual(1))
-        const myDepth = P.sub(this.#camPos).dot(this.#lookDir)
-        const closest = texture(depthTex, suv).x
-        const dist = myDepth.sub(closest)
-        const occluded = onMap.and(dist.greaterThan(this.#rayBias))
-        const ndot = N.dot(this.#sampleDir)
+    const index = geometry.getIndex()
+    // Read through the accessors rather than `.array`: glTF positions are
+    // routinely interleaved, and a BVH built over the raw buffer would trace a
+    // different mesh than the one being rasterised.
+    const positions = attributeToFloat32(position, 3)
+    const indices = index
+      ? Uint32Array.from(index.array as ArrayLike<number>)
+      : Uint32Array.from({ length: position.count }, (_, i) => i)
 
-        If(ndot.greaterThan(float(0.05)), () => {
-          count.addAssign(float(1))
-          If(occluded.and(dist.lessThan(this.#aoDistance)), () => {
-            const falloff = float(1).sub(dist.div(this.#aoDistance)).clamp(0, 1)
-            occ.addAssign(falloff.mul(ndot))
-          })
-        })
-        If(ndot.lessThan(float(-0.25)).and(occluded), () => {
-          thick.assign(min(thick, max(dist, float(0))))
-        })
-      })
-
-      return vec4(occ, count, thick, curv)
-    })()
-    return material
+    this.#bvh?.dispose()
+    this.#bvh = new BvhTextures(new Bvh({ positions, indices }).packForGpu())
+    this.#bvhKey = key
+    this.#materialKey = ''
+    return this.#bvh
   }
 
-  #buildComposeMaterial(maps: MeshMaps, accum: RenderTarget): MeshBasicNodeMaterial {
-    const material = new MeshBasicNodeMaterial()
-    material.depthTest = false
-    material.depthWrite = false
-    material.blending = NoBlending
-    const uvNode = uv()
-    const island = texture(maps.islandMask.texture, uvNode).x
-    const acc = texture(accum.texture, uvNode)
-    const ao = float(1).sub(acc.x.div(max(acc.y, float(1))).clamp(0, 1))
-    const thick = acc.z.div(max(this.#aoDistance.mul(4), float(1e-4))).clamp(0, 1)
-    const inside = island.greaterThan(float(0.5))
-    material.fragmentNode = vec4(
-      inside.select(ao, float(1)),
-      inside.select(acc.w, float(0.5)),
-      inside.select(thick, float(0.5)),
-      island,
-    )
-    return material
+  #prepareMaterials(bvh: BvhTextures, accum: RenderTarget): void {
+    const key = `${this.#bvhKey}:${accum.texture.id}`
+    if (this.#materialKey === key && this.#traceMaterial) return
+    this.#disposePassMaterials()
+    this.#traceMaterial = this.#buildTraceMaterial(bvh)
+    this.#composeMaterial = this.#buildComposeMaterial(accum)
+    this.#materialKey = key
   }
 
-  #setupDepthCamera(dir: Vector3, center: Vector3, radius: number): void {
-    const pad = radius * 1.15
-    const cam = this.#depthCamera
-    cam.left = -pad
-    cam.right = pad
-    cam.top = pad
-    cam.bottom = -pad
-    cam.near = 0.001
-    cam.far = pad * 2 + 0.002
-    cam.position.copy(center).addScaledVector(dir, pad)
-    cam.up.set(0, 1, 0)
-    if (Math.abs(dir.y) > 0.9) cam.up.set(1, 0, 0)
-    cam.lookAt(center)
-    cam.updateProjectionMatrix()
-    cam.updateMatrixWorld(true)
-    this.#camPos.value.copy(cam.position)
-    cam.getWorldDirection(this.#lookDir.value)
-    this.#sampleDir.value.copy(dir)
-    this.#viewProj.value.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse)
+  /**
+   * Compiles every pipeline against the target it will be used on.
+   *
+   * three's WebGPU backend builds pipelines lazily and silently skips the draw
+   * that triggers the build. With a ping-pong accumulator that is not a missing
+   * first frame but a permanently empty buffer on one side of the swap.
+   */
+  async #prewarm(
+    renderer: Renderer,
+    geometry: BufferGeometry,
+    maps: MeshMaps,
+    accum: RenderTarget,
+  ): Promise<void> {
+    await this.#compileMesh(renderer, geometry, this.#traceMaterial!, accum)
+    await this.#compileMesh(renderer, geometry, this.#composeMaterial!, maps.ray)
+    await this.#compileQuad(renderer, this.#zeroMaterialFor(), accum)
+    await this.#compileQuad(renderer, this.#zeroMaterialFor(), maps.ray)
   }
 
-  #renderDepth(renderer: Renderer, target: RenderTarget): void {
-    renderQuad(renderer, this.#quad, this.#farClearMaterialFor(), target)
-    const previousTarget = renderer.getRenderTarget()
-    const previousAutoClear = renderer.autoClear
-    renderer.autoClear = false
-    renderer.setRenderTarget(target)
+  async #compileMesh(
+    renderer: Renderer,
+    geometry: BufferGeometry,
+    material: NodeMaterial,
+    target: RenderTarget,
+  ): Promise<void> {
+    // `UVSpacePass.render` forces double-sided and the pipeline is keyed on it,
+    // so the compile has to see the value the draw will.
+    material.side = DoubleSide
+    this.#uvPass.mesh.geometry = geometry
+    this.#uvPass.mesh.material = material
+    await compileAgainst(renderer, this.#uvPass.scene, this.#uvPass.camera, target)
+  }
+
+  async #compileQuad(renderer: Renderer, material: MeshBasicNodeMaterial, target: RenderTarget): Promise<void> {
+    this.#quad.material = material
+    this.#quadScene.add(this.#quad)
     try {
-      renderer.clear(false, true, false)
-      renderer.render(this.#depthScene, this.#depthCamera)
-      // WebGPU skips the first draw of a new pipeline; a second submit is cheap
-      // next to the rest of the bake and fills an otherwise empty depth map.
-      renderer.render(this.#depthScene, this.#depthCamera)
+      await compileAgainst(renderer, this.#quadScene, this.#quad.camera, target)
     } finally {
-      renderer.autoClear = previousAutoClear
-      renderer.setRenderTarget(previousTarget)
+      this.#quadScene.remove(this.#quad)
     }
   }
 
-  #ensureDepth(): RenderTarget {
-    if (this.#depthRT) return this.#depthRT
-    this.#depthRT = new RenderTarget(DEPTH_MAP_SIZE, DEPTH_MAP_SIZE, {
-      ...CHANNEL_TARGET_OPTIONS,
-      depthBuffer: true,
-    })
-    this.#depthRT.texture.name = 'bakeDepth'
-    return this.#depthRT
-  }
-
+  /**
+   * Half float, because the accumulation is done by the blender and WebGPU only
+   * blends 32-bit float attachments behind an optional feature. Nearest
+   * filtered because the compose pass reads it at a raster fragment's uv rather
+   * than at a texel centre, and a linear tap would pull in three neighbours.
+   */
   #ensureAccum(resolution: number): RenderTarget {
-    if (this.#accumA && this.#accumA.width === resolution) return this.#accumA
-    this.#accumA?.dispose()
-    this.#accumA = createRayTarget(resolution, 'bakeAccumA')
-    this.#mapsKey = ''
-    return this.#accumA
+    if (this.#accum && this.#accum.width === resolution) return this.#accum
+    this.#accum?.dispose()
+    this.#accum = new RenderTarget(resolution, resolution, {
+      ...CHANNEL_TARGET_OPTIONS,
+      format: RGBAFormat,
+      minFilter: NearestFilter,
+      magFilter: NearestFilter,
+    })
+    this.#accum.texture.name = 'bakeAccum'
+    this.#materialKey = ''
+    return this.#accum
   }
 
-  #ensureAccumB(resolution: number): RenderTarget {
-    if (this.#accumB && this.#accumB.width === resolution) return this.#accumB
-    this.#accumB?.dispose()
-    this.#accumB = createRayTarget(resolution, 'bakeAccumB')
-    this.#mapsKey = ''
-    return this.#accumB
+  /**
+   * Frees the accumulator between bakes. It follows the texture set's
+   * resolution, so at 2k it is ~33MB of idle VRAM for a pass the user runs by
+   * hand. The BVH stays: it is much smaller, and rebuilding it is the slow,
+   * CPU-bound part.
+   */
+  #releaseScratch(): void {
+    this.#accum?.dispose()
+    this.#accum = null
+    this.#disposePassMaterials()
+    this.#materialKey = ''
+  }
+
+  #disposePassMaterials(): void {
+    this.#traceMaterial?.dispose()
+    this.#composeMaterial?.dispose()
+    this.#traceMaterial = null
+    this.#composeMaterial = null
   }
 
   dispose(): void {
-    this.#curvatureMaterial?.dispose()
-    this.#depthMaterial?.dispose()
-    this.#farClearMaterial?.dispose()
-    this.#accumReadA?.dispose()
-    this.#accumReadB?.dispose()
-    this.#composeReadA?.dispose()
-    this.#composeReadB?.dispose()
-    this.#depthRT?.dispose()
-    this.#accumA?.dispose()
-    this.#accumB?.dispose()
+    this.#releaseScratch()
+    this.#zeroMaterial?.dispose()
+    this.#zeroMaterial = null
+    this.#bvh?.dispose()
+    this.#bvh = null
+    this.#bvhKey = ''
     this.#uvPass.dispose()
-    this.#depthScene.remove(this.#depthMesh)
   }
 }
 
-function fibonacciSphere(count: number): Vector3[] {
-  const out: Vector3[] = []
-  const golden = Math.PI * (3 - Math.sqrt(5))
-  for (let i = 0; i < count; i++) {
-    const y = count === 1 ? 0 : 1 - (i / (count - 1)) * 2
-    const r = Math.sqrt(Math.max(0, 1 - y * y))
-    const theta = golden * i
-    out.push(new Vector3(Math.cos(theta) * r, y, Math.sin(theta) * r).normalize())
-  }
-  return out
+// -- sampling ---------------------------------------------------------------
+
+interface Frame {
+  tangent: V3
+  bitangent: V3
+}
+
+/**
+ * Any orthonormal basis around `n`.
+ *
+ * The helper axis is whichever of z and x the normal is least aligned with, so
+ * the cross product never approaches zero - at a pole of a lat/long unwrap the
+ * naive choice collapses the frame and every ray leaves along the same line.
+ */
+function orthonormalFrame(n: V3): Frame {
+  const helper = abs(n.z).lessThan(float(0.99)).select(vec3(0, 0, 1), vec3(1, 0, 0)) as V3
+  const tangent = normalize(cross(helper, n)) as V3
+  return { tangent, bitangent: cross(n, tangent) as V3 }
+}
+
+/**
+ * A cosine-weighted direction in the +z hemisphere, from two uniforms.
+ *
+ * Cosine weighted rather than uniform so the mean of the hit tests *is* the
+ * occlusion integral - no per-ray `dot(n, l)` factor and no weight sum to
+ * divide by afterwards. That symmetry is what the old code got wrong when it
+ * divided a cosine-weighted numerator by a plain ray count, which capped AO at
+ * roughly mid grey however buried the texel was.
+ */
+function cosineHemisphere(u1: F, u2: F): V3 {
+  const r = sqrt(u1)
+  const phi = u2.mul(float(Math.PI * 2))
+  return vec3(r.mul(cos(phi)), r.mul(sin(phi)), sqrt(max(float(0), float(1).sub(u1)))) as V3
+}
+
+/** Per-texel decorrelation offset. Cheap, and only ever used to rotate a set. */
+function hash(at: V2): F {
+  return fract(sin(at.dot(vec2(12.9898, 78.233))).mul(float(43758.5453))) as F
 }

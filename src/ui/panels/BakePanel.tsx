@@ -54,28 +54,20 @@ export function BakeSection() {
       </div>
 
       <p className="px-2 py-1.5 text-[10px] leading-snug text-app-faint">
-        Ambient occlusion, curvature and thickness are baked in the same UV-space GPU pass as the geometry maps, so
-        they cannot disagree about which texel is surface. Geometry maps update automatically whenever the mesh
-        changes; these three need an explicit bake.
+        Ambient occlusion and thickness are traced against the mesh itself; curvature is measured on its
+        connectivity. All three rasterise the mesh into UV space at the texture set’s resolution, so nothing can
+        disagree about which texel is surface. Geometry maps update whenever the mesh changes; these three need an
+        explicit bake.
       </p>
 
       <ParamGroupLabel>Settings</ParamGroupLabel>
       <Slider
-        label="Resolution"
-        hint="Mesh maps are low frequency, so they are usually fine at half the texture resolution."
-        value={settings.resolution}
-        min={128}
-        max={2048}
-        step={128}
-        onChange={(resolution) => patch({ resolution: Math.round(resolution) })}
-      />
-      <Slider
-        label="AO Directions"
-        hint="Visibility is accumulated from this many directions around the mesh. More is smoother."
+        label="AO Rays"
+        hint="Rays traced per texel. Noise falls as the square root of this, so doubling it halves the grain — and doubles the bake."
         value={settings.aoRays}
         min={8}
-        max={64}
-        step={1}
+        max={512}
+        step={8}
         onChange={(aoRays) => patch({ aoRays: Math.round(aoRays) })}
       />
       <Slider
@@ -88,12 +80,13 @@ export function BakeSection() {
         onChange={(aoDistance) => patch({ aoDistance })}
       />
       <Slider
-        label="Thickness Rays"
-        value={settings.thicknessRays}
-        min={0}
-        max={128}
-        step={1}
-        onChange={(thicknessRays) => patch({ thicknessRays: Math.round(thicknessRays) })}
+        label="Thickness Depth"
+        hint="How far a probe looks for the far side of the model, as a fraction of its size. Anything thicker than this reads as solid."
+        value={settings.thicknessDistance}
+        min={0.05}
+        max={2}
+        step={0.01}
+        onChange={(thicknessDistance) => patch({ thicknessDistance })}
       />
       <Slider
         label="Curv. Contrast"

@@ -27,6 +27,16 @@ export class Bvh {
   private nodes: Int32Array
   /** Triangle order after partitioning. */
   private order: Uint32Array
+  /**
+   * Index of the next node in depth-first order that is *not* under this one.
+   *
+   * This is what lets the GPU walk the tree without a stack: nodes are built in
+   * DFS preorder, so a node's left child is always `node + 1` and a miss just
+   * jumps to `escape`. A fragment shader has no cheap per-lane stack, and a
+   * fixed-size one large enough for a deep tree costs registers on every lane
+   * whether it needs them or not.
+   */
+  private escape: Int32Array
   private nodeCount = 0
   private stack = new Int32Array(STACK_SIZE)
 
@@ -43,6 +53,7 @@ export class Bvh {
     const maxNodes = Math.max(1, 2 * Math.ceil(triangleCount / LEAF_SIZE) + 1) * 2
     this.bounds = new Float32Array(maxNodes * 6)
     this.nodes = new Int32Array(maxNodes * 4)
+    this.escape = new Int32Array(maxNodes)
 
     const centroids = new Float32Array(triangleCount * 3)
     for (let t = 0; t < triangleCount; t++) {
@@ -88,6 +99,7 @@ export class Bvh {
       this.nodes[n] = -1
       this.nodes[n + 2] = start
       this.nodes[n + 3] = count
+      this.escape[node] = this.nodeCount
       return node
     }
 
@@ -137,6 +149,9 @@ export class Bvh {
     // storing the right child explicitly keeps traversal free of any walk.
     this.nodes[n] = left
     this.nodes[n + 1] = right
+    // Everything under this node has now been allocated, so the next free index
+    // is exactly where a miss should resume.
+    this.escape[node] = this.nodeCount
     return node
   }
 
@@ -303,4 +318,158 @@ export class Bvh {
     }
     return false
   }
+
+  /**
+   * The same tree, flattened for a shader.
+   *
+   * Two RGBA32F texels per node and three per triangle, both indexed linearly,
+   * because a fragment shader can only fetch texels - not walk pointers into a
+   * JS object graph. Triangles are emitted in `order`, so a leaf's `start` and
+   * `count` address a contiguous run and the shader never has to indirect
+   * through the permutation.
+   *
+   * The leaf payload rides in one float: `start * 16 + count + 1`, with zero
+   * meaning "internal node". `count` is at most `LEAF_SIZE` (8) so four bits is
+   * plenty, and float32 holds the product exactly up to a million triangles -
+   * well past what a browser will bake.
+   */
+  packForGpu(): PackedBvh {
+    const nodeCount = this.nodeCount
+    const nodes = new Float32Array(nodeCount * 8)
+    for (let i = 0; i < nodeCount; i++) {
+      const b = i * 6
+      const n = i * 4
+      const o = i * 8
+      nodes[o] = this.bounds[b]
+      nodes[o + 1] = this.bounds[b + 1]
+      nodes[o + 2] = this.bounds[b + 2]
+      nodes[o + 3] = this.escape[i]
+      nodes[o + 4] = this.bounds[b + 3]
+      nodes[o + 5] = this.bounds[b + 4]
+      nodes[o + 6] = this.bounds[b + 5]
+      nodes[o + 7] = this.nodes[n] < 0 ? this.nodes[n + 2] * 16 + this.nodes[n + 3] + 1 : 0
+    }
+
+    const triangleCount = this.order.length
+    // v0, e1, e2 rather than three corners: the edges are what the intersection
+    // test wants, and precomputing them here takes two subtractions off every
+    // triangle test in every ray.
+    const triangles = new Float32Array(triangleCount * 12)
+    for (let i = 0; i < triangleCount; i++) {
+      const tri = this.order[i] * 3
+      const a = this.indices[tri] * 3
+      const b = this.indices[tri + 1] * 3
+      const c = this.indices[tri + 2] * 3
+      const o = i * 12
+      for (let k = 0; k < 3; k++) {
+        triangles[o + k] = this.positions[a + k]
+        triangles[o + 4 + k] = this.positions[b + k] - this.positions[a + k]
+        triangles[o + 8 + k] = this.positions[c + k] - this.positions[a + k]
+      }
+    }
+
+    return { nodes, nodeCount, triangles, triangleCount }
+  }
+}
+
+export interface PackedBvh {
+  /** Two RGBA texels per node: (min.xyz, escape) and (max.xyz, leafPayload). */
+  nodes: Float32Array
+  nodeCount: number
+  /** Three RGBA texels per triangle: v0, edge1, edge2 (w unused). */
+  triangles: Float32Array
+  triangleCount: number
+}
+
+/**
+ * The stackless walk, in plain JS, exactly as the shader performs it.
+ *
+ * This exists to be tested. The GPU version cannot be stepped through or
+ * asserted against anything, so the algorithm is written once here, checked
+ * against `Bvh.raycast` on real meshes, and only then transcribed into TSL -
+ * which leaves shader bugs as transcription bugs rather than logic bugs.
+ */
+export function packedRaycast(
+  bvh: PackedBvh,
+  ox: number, oy: number, oz: number,
+  dx: number, dy: number, dz: number,
+  minDistance: number,
+  maxDistance: number,
+  anyHit: boolean,
+): number {
+  const { nodes, triangles, nodeCount } = bvh
+  const invX = 1 / dx, invY = 1 / dy, invZ = 1 / dz
+  let closest = maxDistance
+  let hit = false
+  let i = 0
+
+  while (i < nodeCount) {
+    const o = i * 8
+    let t0 = (nodes[o] - ox) * invX
+    let t1 = (nodes[o + 4] - ox) * invX
+    let tnear = Math.min(t0, t1)
+    let tfar = Math.max(t0, t1)
+    t0 = (nodes[o + 1] - oy) * invY
+    t1 = (nodes[o + 5] - oy) * invY
+    tnear = Math.max(tnear, Math.min(t0, t1))
+    tfar = Math.min(tfar, Math.max(t0, t1))
+    t0 = (nodes[o + 2] - oz) * invZ
+    t1 = (nodes[o + 6] - oz) * invZ
+    tnear = Math.max(tnear, Math.min(t0, t1))
+    tfar = Math.min(tfar, Math.max(t0, t1))
+
+    if (tfar < Math.max(tnear, minDistance) || tnear > closest) {
+      i = nodes[o + 3]
+      continue
+    }
+
+    const payload = nodes[o + 7]
+    if (payload > 0) {
+      const p = payload - 1
+      const start = Math.floor(p / 16)
+      const count = p - start * 16
+      for (let k = 0; k < count; k++) {
+        const t = intersectTriangle(
+          triangles, (start + k) * 12,
+          ox, oy, oz, dx, dy, dz,
+        )
+        if (t >= minDistance && t < closest) {
+          closest = t
+          hit = true
+          if (anyHit) return closest
+        }
+      }
+    }
+    // On a hit the left child is the very next node, and for a leaf that is the
+    // same index its escape would name - so both cases advance by one.
+    i += 1
+  }
+
+  return hit ? closest : -1
+}
+
+/** Moller-Trumbore against a packed (v0, e1, e2) triangle. -1 for a miss. */
+function intersectTriangle(
+  tri: Float32Array, o: number,
+  ox: number, oy: number, oz: number,
+  dx: number, dy: number, dz: number,
+): number {
+  const ax = tri[o], ay = tri[o + 1], az = tri[o + 2]
+  const e1x = tri[o + 4], e1y = tri[o + 5], e1z = tri[o + 6]
+  const e2x = tri[o + 8], e2y = tri[o + 9], e2z = tri[o + 10]
+  const px = dy * e2z - dz * e2y
+  const py = dz * e2x - dx * e2z
+  const pz = dx * e2y - dy * e2x
+  const det = e1x * px + e1y * py + e1z * pz
+  if (det > -1e-12 && det < 1e-12) return -1
+  const inv = 1 / det
+  const tvx = ox - ax, tvy = oy - ay, tvz = oz - az
+  const u = (tvx * px + tvy * py + tvz * pz) * inv
+  if (u < 0 || u > 1) return -1
+  const qx = tvy * e1z - tvz * e1y
+  const qy = tvz * e1x - tvx * e1z
+  const qz = tvx * e1y - tvy * e1x
+  const v = (dx * qx + dy * qy + dz * qz) * inv
+  if (v < 0 || u + v > 1) return -1
+  return (e2x * qx + e2y * qy + e2z * qz) * inv
 }

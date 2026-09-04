@@ -444,13 +444,13 @@ export class Engine {
     this.#baking = true
     try {
       if (!this.#meshMaps.geometryBaked) this.#bakeGeometry({ silent: true })
-      this.#meshMapBaker.bake(renderer, geometry, this.#meshMaps, merged, (progress) => {
+      await this.#meshMapBaker.bake(renderer, geometry, this.#meshMaps, merged, (progress) => {
         this.events.emit('bakeProgress', progress)
       })
       this.#dilator.dilateRay(renderer, this.#meshMaps, merged.dilation)
       this.events.emit('bakeProgress', { fraction: 1, message: 'Done' })
       set.meshMaps = {
-        resolution: merged.resolution,
+        resolution: this.#meshMaps.resolution,
         available: ['ao', 'curvature', 'thickness'],
         settings: merged,
         bakedAt: Date.now(),

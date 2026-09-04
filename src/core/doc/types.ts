@@ -155,15 +155,31 @@ export interface MeshMapsState {
 }
 
 export interface BakeSettings {
+  /**
+   * @deprecated The maps bake at the texture set's resolution, and AO traces
+   * the mesh rather than gathering from depth maps, so there is nothing left
+   * for this to size. Kept so saved projects still deserialise.
+   */
   resolution: number
+  /** Rays per texel for AO. Rounded up to a multiple of the pass size. */
   aoRays: number
   aoDistance: number
+  /** @deprecated The GPU baker shares one direction set between AO and thickness. */
   thicknessRays: number
+  /**
+   * How far a thickness probe looks for the far side of the model, as a
+   * fraction of the model radius. Anything thicker than this reads as solid.
+   */
+  thicknessDistance: number
   curvatureRadius: number
   curvatureIntensity: number
   /** Dilation passes applied past UV island borders. */
   dilation: number
-  /** Cosine bias that keeps AO rays off the originating surface. */
+  /**
+   * How far a ray starts off its own surface, as a fraction of the model
+   * radius. Only has to clear float error on the originating triangle now that
+   * rays hit real geometry rather than a rasterised depth map.
+   */
   rayBias: number
 }
 
@@ -227,12 +243,13 @@ export const DEFAULT_PROJECTION: ProjectionSettings = {
  * of it for when quality matters more than the wait.
  */
 export const DEFAULT_BAKE_SETTINGS: BakeSettings = {
-  resolution: 384,
-  aoRays: 32,
+  resolution: 1024,
+  aoRays: 64,
   aoDistance: 0.5,
   thicknessRays: 12,
+  thicknessDistance: 0.5,
   curvatureRadius: 1,
   curvatureIntensity: 1,
   dilation: 12,
-  rayBias: 1e-3,
+  rayBias: 2e-4,
 }

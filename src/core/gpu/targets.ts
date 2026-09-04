@@ -25,6 +25,15 @@ import { SLOT_COUNT, SLOT_NAMES } from '../channels'
  * between render targets require *identical* formats in WebGPU - a scratch
  * buffer that quietly defaults to RGBA8 fails validation against an RGBA16F
  * destination.
+ *
+ * Half float rather than full float is also a hard constraint, not a size
+ * choice. WebGPU treats rgba32float as unfilterable unless the adapter offers
+ * `float32-filterable`, and three binds every non-depth texture with a
+ * filtering sampler - so a full-float target read through `texture()` fails
+ * bind group validation, and the pipeline it belonged to is dropped without an
+ * error anyone sees: the draw simply does nothing and the target keeps whatever
+ * was in that memory. If a pass ever needs full float, it has to read it with
+ * `textureLoad`, which binds no sampler.
  */
 export const CHANNEL_TARGET_OPTIONS = {
   depthBuffer: false,
