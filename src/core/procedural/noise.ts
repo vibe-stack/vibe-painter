@@ -47,16 +47,28 @@ import { fl } from '../gpu/nodes'
 export const hash22 = /*#__PURE__*/ Fn(([p]: [V2]): V2 => {
   const q = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)))
   return fract(sin(q).mul(43758.5453123))
+}).setLayout({
+  name: 'hash22',
+  type: 'vec2',
+  inputs: [{ name: 'p', type: 'vec2' }],
 })
 
 /** 2D -> 1D hash in 0..1. */
 export const hash21 = /*#__PURE__*/ Fn(([p]: [V2]): F => {
   return fract(sin(dot(p, vec2(127.1, 311.7))).mul(43758.5453123))
+}).setLayout({
+  name: 'hash21',
+  type: 'float',
+  inputs: [{ name: 'p', type: 'vec2' }],
 })
 
 /** 3D -> 1D hash in 0..1. */
 export const hash31 = /*#__PURE__*/ Fn(([p]: [V3]): F => {
   return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))).mul(43758.5453123))
+}).setLayout({
+  name: 'hash31',
+  type: 'float',
+  inputs: [{ name: 'p', type: 'vec3' }],
 })
 
 // ---------------------------------------------------------------------------
@@ -99,6 +111,10 @@ export const ridged = /*#__PURE__*/ Fn(([p, octaves, gain]: [V3, F, F]): F => {
     })
   })
   return sum.div(max(norm, float(1e-4)))
+}).setLayout({
+  name: 'ridged',
+  type: 'float',
+  inputs: [{ name: 'p', type: 'vec3' }, { name: 'octaves', type: 'float' }, { name: 'gain', type: 'float' }],
 })
 
 /** Worley / cellular noise distance field, 0..1. */
@@ -111,7 +127,7 @@ export function worley(p: V3, jitter = 1): F {
  * highest value-per-instruction tricks in procedural texturing - it turns
  * regular patterns into organic ones (marble veins, rust bloom, cloud edges).
  */
-export function warp(p: V3, amount: FloatIn, frequency: FloatIn = 1): V3 {
+const warpFn = /*#__PURE__*/ Fn(([p, amount, frequency]: [V3, F, F]): V3 => {
   const scaled = p.mul(frequency)
   const offset = vec3(
     mx_noise_float(scaled),
@@ -119,6 +135,14 @@ export function warp(p: V3, amount: FloatIn, frequency: FloatIn = 1): V3 {
     mx_noise_float(scaled.add(vec3(-13.7, 27.1, 91.4))),
   )
   return p.add(offset.mul(amount))
+}).setLayout({
+  name: 'warp',
+  type: 'vec3',
+  inputs: [{ name: 'p', type: 'vec3' }, { name: 'amount', type: 'float' }, { name: 'frequency', type: 'float' }],
+})
+
+export function warp(p: V3, amount: FloatIn, frequency: FloatIn = 1): V3 {
+  return warpFn(p, fl(amount), fl(frequency))
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +180,10 @@ export const voronoi2 = /*#__PURE__*/ Fn(([p, jitter]: [V2, F]): V4 => {
   })
 
   return vec4(f1, f2, id)
+}).setLayout({
+  name: 'voronoi2',
+  type: 'vec4',
+  inputs: [{ name: 'p', type: 'vec2' }, { name: 'jitter', type: 'float' }],
 })
 
 /** Random value per Voronoi cell, 0..1. */
@@ -184,6 +212,10 @@ export const brickGrid = /*#__PURE__*/ Fn(([p, rowOffset]: [V2, F]): V4 => {
   const row = floor(p.y)
   const shifted = vec2(p.x.add(row.mul(rowOffset)), p.y)
   return vec4(fract(shifted), floor(shifted))
+}).setLayout({
+  name: 'brickGrid',
+  type: 'vec4',
+  inputs: [{ name: 'p', type: 'vec2' }, { name: 'rowOffset', type: 'float' }],
 })
 
 /** Signed distance to the edge of a unit cell, 0 at the edge, 0.5 at centre. */
@@ -208,6 +240,10 @@ export const hexGrid = /*#__PURE__*/ Fn(([p]: [V2]): V4 => {
   const local = mix(b, a, useA)
   const id = p.sub(local)
   return vec4(local, id)
+}).setLayout({
+  name: 'hexGrid',
+  type: 'vec4',
+  inputs: [{ name: 'p', type: 'vec2' }],
 })
 
 export function checker(p: V2): F {
@@ -216,11 +252,17 @@ export function checker(p: V2): F {
 }
 
 /** Anti-aliased stripes. `duty` is the fraction of the period that is "on". */
-export function stripes(x: F, duty: FloatIn, softness: FloatIn = 0.02): F {
+const stripesFn = /*#__PURE__*/ Fn(([x, d, s]: [F, F, F]): F => {
   const t = fract(x)
-  const d = fl(duty)
-  const s = fl(softness)
   return smoothstep(float(0).sub(s), s, t).mul(smoothstep(d.sub(s), d.add(s), t).oneMinus())
+}).setLayout({
+  name: 'stripes',
+  type: 'float',
+  inputs: [{ name: 'x', type: 'float' }, { name: 'duty', type: 'float' }, { name: 'softness', type: 'float' }],
+})
+
+export function stripes(x: F, duty: FloatIn, softness: FloatIn = 0.02): F {
+  return stripesFn(x, fl(duty), fl(softness))
 }
 
 /**
@@ -235,6 +277,10 @@ export const scratches = /*#__PURE__*/ Fn(([p, angle, stretch, density]: [V2, F,
   const stretched = vec2(rotated.x.mul(stretch), rotated.y)
   const n = fbm01(vec3(stretched.mul(density), 0), 4, 2.2, 0.55)
   return smoothstep(float(0.45), float(0.62), n)
+}).setLayout({
+  name: 'scratches',
+  type: 'float',
+  inputs: [{ name: 'p', type: 'vec2' }, { name: 'angle', type: 'float' }, { name: 'stretch', type: 'float' }, { name: 'density', type: 'float' }],
 })
 
 /** Radial coordinate helper: `(radius, angle01)` around a centre. */
@@ -270,6 +316,23 @@ export function normalFromHeightFn(
 }
 
 /** Remaps 0..1 through the classic levels controls. */
+const levelsFn = /*#__PURE__*/ Fn(([value, lo, hi, gamma, outLow, outHigh]: [F, F, F, F, F, F]): F => {
+  const t = value.sub(lo).div(max(hi.sub(lo), float(1e-5))).clamp(0, 1)
+  const shaped = t.pow(float(1).div(max(gamma, float(1e-3))))
+  return mix(outLow, outHigh, shaped)
+}).setLayout({
+  name: 'levels',
+  type: 'float',
+  inputs: [
+    { name: 'value', type: 'float' },
+    { name: 'inLow', type: 'float' },
+    { name: 'inHigh', type: 'float' },
+    { name: 'gamma', type: 'float' },
+    { name: 'outLow', type: 'float' },
+    { name: 'outHigh', type: 'float' },
+  ],
+})
+
 export function levels(
   value: F,
   inLow: FloatIn,
@@ -278,11 +341,7 @@ export function levels(
   outLow: FloatIn,
   outHigh: FloatIn,
 ): F {
-  const lo = fl(inLow)
-  const hi = fl(inHigh)
-  const t = value.sub(lo).div(max(hi.sub(lo), float(1e-5))).clamp(0, 1)
-  const shaped = t.pow(float(1).div(max(fl(gamma), float(1e-3))))
-  return mix(fl(outLow), fl(outHigh), shaped)
+  return levelsFn(value, fl(inLow), fl(inHigh), fl(gamma), fl(outLow), fl(outHigh))
 }
 
 /** Linear interpolation between three colours by a 0..1 selector. */
@@ -312,6 +371,25 @@ export function gradient3(t: F, a: V3, b: V3, c: V3): V3 {
  *
  * `t` is a 0..1 selector (a per-cell hash, a noise field); 0.5 is no change.
  */
+const tintVariationFn = /*#__PURE__*/ Fn(([colour, t, hue, saturation, value]: [V3, F, F, F, F]): V3 => {
+  const hsv = mx_rgbtohsv(colour) as unknown as V3
+  const d = t.sub(0.5).mul(2)
+  const h = fract(hsv.x.add(d.mul(hue)))
+  const s = hsv.y.mul(float(1).add(d.mul(saturation))).clamp(0, 1)
+  const v = hsv.z.mul(float(1).add(d.mul(value))).max(0)
+  return mx_hsvtorgb(vec3(h, s, v)) as unknown as V3
+}).setLayout({
+  name: 'tintVariation',
+  type: 'vec3',
+  inputs: [
+    { name: 'colour', type: 'vec3' },
+    { name: 't', type: 'float' },
+    { name: 'hue', type: 'float' },
+    { name: 'saturation', type: 'float' },
+    { name: 'value', type: 'float' },
+  ],
+})
+
 export function tintVariation(
   colour: V3,
   t: F,
@@ -319,12 +397,7 @@ export function tintVariation(
   saturation: FloatIn = 0.12,
   value: FloatIn = 0.16,
 ): V3 {
-  const hsv = mx_rgbtohsv(colour) as unknown as V3
-  const d = t.sub(0.5).mul(2)
-  const h = fract(hsv.x.add(d.mul(fl(hue))))
-  const s = hsv.y.mul(float(1).add(d.mul(fl(saturation)))).clamp(0, 1)
-  const v = hsv.z.mul(float(1).add(d.mul(fl(value)))).max(0)
-  return mx_hsvtorgb(vec3(h, s, v)) as unknown as V3
+  return tintVariationFn(colour, t, fl(hue), fl(saturation), fl(value))
 }
 
 /**
@@ -334,11 +407,19 @@ export function tintVariation(
  * and a lerp destroys both. RNM rotates the detail into the base's frame,
  * which is what keeps fine grain visible on the walls of a deep dent.
  */
-export function blendDetailNormal(base: V3, detail: V3, strength: FloatIn = 1): V3 {
-  const scaled = normalize(vec3(detail.x.mul(fl(strength)), detail.y.mul(fl(strength)), detail.z))
+const blendDetailNormalFn = /*#__PURE__*/ Fn(([base, detail, strength]: [V3, V3, F]): V3 => {
+  const scaled = normalize(vec3(detail.x.mul(strength), detail.y.mul(strength), detail.z))
   const t = base.add(vec3(0, 0, 1))
   const u = scaled.mul(vec3(-1, -1, 1))
   return normalize(t.mul(t.dot(u)).div(max(t.z, float(1e-4))).sub(u))
+}).setLayout({
+  name: 'blendDetailNormal',
+  type: 'vec3',
+  inputs: [{ name: 'base', type: 'vec3' }, { name: 'detail', type: 'vec3' }, { name: 'strength', type: 'float' }],
+})
+
+export function blendDetailNormal(base: V3, detail: V3, strength: FloatIn = 1): V3 {
+  return blendDetailNormalFn(base, detail, fl(strength))
 }
 
 /**
@@ -352,11 +433,19 @@ export function blendDetailNormal(base: V3, detail: V3, strength: FloatIn = 1): 
  * alternative, re-sampling the height function in a ring, multiplies the cost
  * of every material by another four or eight evaluations.
  */
-export function cavityAO(height01: F, normal: V3, strength: FloatIn = 0.6): F {
-  const s = fl(strength).clamp(0, 1)
+const cavityAOFn = /*#__PURE__*/ Fn(([height01, normal, strength]: [F, V3, F]): F => {
+  const s = strength.clamp(0, 1)
   const fromHeight = mix(float(1).sub(s), float(1), height01.clamp(0, 1))
   const fromSlope = mix(float(1).sub(s.mul(0.55)), float(1), normal.z.clamp(0, 1).pow(0.7))
   return fromHeight.mul(fromSlope).clamp(0, 1)
+}).setLayout({
+  name: 'cavityAO',
+  type: 'float',
+  inputs: [{ name: 'height01', type: 'float' }, { name: 'normal', type: 'vec3' }, { name: 'strength', type: 'float' }],
+})
+
+export function cavityAO(height01: F, normal: V3, strength: FloatIn = 0.6): F {
+  return cavityAOFn(height01, normal, fl(strength))
 }
 
 /**
@@ -366,8 +455,16 @@ export function cavityAO(height01: F, normal: V3, strength: FloatIn = 0.6): F {
  * a polished surface has fingerprints, dust and polish swirl. Every material
  * in the catalogue folds a little of this in.
  */
+const microVariationFn = /*#__PURE__*/ Fn(([p, scale, seed]: [V2, F, F]): F => {
+  return fbm01(vec3(p.mul(scale), seed), 3, 2.3, 0.55)
+}).setLayout({
+  name: 'microVariation',
+  type: 'float',
+  inputs: [{ name: 'p', type: 'vec2' }, { name: 'scale', type: 'float' }, { name: 'seed', type: 'float' }],
+})
+
 export function microVariation(p: V2, scale: FloatIn, seed: FloatIn = 0): F {
-  return fbm01(vec3(p.mul(fl(scale)), fl(seed)), 3, 2.3, 0.55)
+  return microVariationFn(p, fl(scale), fl(seed))
 }
 
 /**
@@ -377,9 +474,22 @@ export function microVariation(p: V2, scale: FloatIn, seed: FloatIn = 0): F {
  * one per cell, so density is controlled exactly and they never clump into
  * blobs the way a thresholded fbm does.
  */
+const sparkleFn = /*#__PURE__*/ Fn(([p, scale, seed, size]: [V2, F, F, F]): F => {
+  const d = worley(vec3(p.mul(scale), seed), 1)
+  return smoothstep(size, float(0), d)
+}).setLayout({
+  name: 'sparkle',
+  type: 'float',
+  inputs: [
+    { name: 'p', type: 'vec2' },
+    { name: 'scale', type: 'float' },
+    { name: 'seed', type: 'float' },
+    { name: 'size', type: 'float' },
+  ],
+})
+
 export function sparkle(p: V2, scale: FloatIn, seed: FloatIn = 0, size: FloatIn = 0.12): F {
-  const d = worley(vec3(p.mul(fl(scale)), fl(seed)), 1)
-  return smoothstep(fl(size), float(0), d)
+  return sparkleFn(p, fl(scale), fl(seed), fl(size))
 }
 
 /**
@@ -387,12 +497,25 @@ export function sparkle(p: V2, scale: FloatIn, seed: FloatIn = 0, size: FloatIn 
  * so the crack fades out along its length instead of forming a closed mesh -
  * real cracks terminate, and a perfect polygon net is the giveaway.
  */
-export function cracks(p: V2, scale: FloatIn, width: FloatIn, seed: FloatIn = 0): F {
-  const cells = voronoi2(p.mul(fl(scale)), float(0.95))
+const cracksFn = /*#__PURE__*/ Fn(([p, scale, width, seed]: [V2, F, F, F]): F => {
+  const cells = voronoi2(p.mul(scale), float(0.95))
   const border = voronoiBorder(cells)
-  const line = smoothstep(fl(width), float(0), border)
-  const erosion = fbm01(vec3(p.mul(fl(scale).mul(2.7)), fl(seed)), 3, 2.2, 0.55)
+  const line = smoothstep(width, float(0), border)
+  const erosion = fbm01(vec3(p.mul(scale.mul(2.7)), seed), 3, 2.2, 0.55)
   return line.mul(smoothstep(float(0.3), float(0.62), erosion))
+}).setLayout({
+  name: 'cracks',
+  type: 'float',
+  inputs: [
+    { name: 'p', type: 'vec2' },
+    { name: 'scale', type: 'float' },
+    { name: 'width', type: 'float' },
+    { name: 'seed', type: 'float' },
+  ],
+})
+
+export function cracks(p: V2, scale: FloatIn, width: FloatIn, seed: FloatIn = 0): F {
+  return cracksFn(p, fl(scale), fl(width), fl(seed))
 }
 
 /**
@@ -402,13 +525,25 @@ export function cracks(p: V2, scale: FloatIn, width: FloatIn, seed: FloatIn = 0)
  * only when they know which way is down, which under triplanar means the two
  * vertical planes (axis 0 and 2) - see `MatContext.axis`.
  */
-export function drips(p: V2, scale: FloatIn, length: FloatIn, seed: FloatIn = 0): F {
-  const s = fl(scale)
+const dripsFn = /*#__PURE__*/ Fn(([p, s, runLength, seed]: [V2, F, F, F]): F => {
   // Stretching V compresses the noise vertically, turning blobs into runs.
-  const stretched = vec2(p.x.mul(s), p.y.mul(s).div(max(fl(length), float(0.05))))
-  const field = fbm01(vec3(stretched, fl(seed)), 4, 2.1, 0.55)
+  const stretched = vec2(p.x.mul(s), p.y.mul(s).div(max(runLength, float(0.05))))
+  const field = fbm01(vec3(stretched, seed), 4, 2.1, 0.55)
   // The run fades out downwards rather than ending abruptly.
   return smoothstep(float(0.52), float(0.78), field)
+}).setLayout({
+  name: 'drips',
+  type: 'float',
+  inputs: [
+    { name: 'p', type: 'vec2' },
+    { name: 'scale', type: 'float' },
+    { name: 'length', type: 'float' },
+    { name: 'seed', type: 'float' },
+  ],
+})
+
+export function drips(p: V2, scale: FloatIn, length: FloatIn, seed: FloatIn = 0): F {
+  return dripsFn(p, fl(scale), fl(length), fl(seed))
 }
 
 /**
@@ -419,10 +554,23 @@ export function drips(p: V2, scale: FloatIn, length: FloatIn, seed: FloatIn = 0)
  * gravel through asphalt, aggregate through a thin skim of cement - which is
  * what makes a two-material mix look layered rather than dissolved.
  */
-export function heightBlend(maskValue: F, topHeight: F, bottomHeight: F, contrast: FloatIn = 0.15): F {
-  const c = max(fl(contrast), float(1e-3))
+const heightBlendFn = /*#__PURE__*/ Fn(([maskValue, topHeight, bottomHeight, contrast]: [F, F, F, F]): F => {
+  const c = max(contrast, float(1e-3))
   const bias = topHeight.sub(bottomHeight).mul(0.5)
   return smoothstep(float(0.5).sub(c), float(0.5).add(c), maskValue.add(bias).clamp(0, 1))
+}).setLayout({
+  name: 'heightBlend',
+  type: 'float',
+  inputs: [
+    { name: 'maskValue', type: 'float' },
+    { name: 'topHeight', type: 'float' },
+    { name: 'bottomHeight', type: 'float' },
+    { name: 'contrast', type: 'float' },
+  ],
+})
+
+export function heightBlend(maskValue: F, topHeight: F, bottomHeight: F, contrast: FloatIn = 0.15): F {
+  return heightBlendFn(maskValue, topHeight, bottomHeight, fl(contrast))
 }
 
 /**
@@ -441,4 +589,8 @@ export const pebbles = /*#__PURE__*/ Fn(([p, jitter, roundness]: [V2, F, F]): V4
   // how a worn stone actually sits.
   const dome = smoothstep(float(0), max(roundness, float(1e-3)), border).pow(0.65)
   return vec4(dome, border, cells.z, cells.w)
+}).setLayout({
+  name: 'pebbles',
+  type: 'vec4',
+  inputs: [{ name: 'p', type: 'vec2' }, { name: 'jitter', type: 'float' }, { name: 'roundness', type: 'float' }],
 })

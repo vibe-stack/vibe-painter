@@ -1,93 +1,166 @@
 /**
- * Inspector for the selected layer: its material, how that material is
- * projected onto the surface, and its mask stack.
+ * The selected layer: what it is made of and how that lands on the surface.
+ *
+ * Split into separate section bodies rather than one panel, because the shell
+ * stacks them as independent collapsible sections - material and projection are
+ * edited at different moments and it is worth being able to close one.
  */
 
 import { useApi, useEngineVersion } from '../context'
 import { getMaterialDef } from '../../core/procedural/material'
 import { PROJECTIONS } from '../../core/doc/types'
-import { EmptyHint, Field, Panel, SectionHeading, Select, Slider } from '../widgets/controls'
+import { EmptyHint, NumberField, Row, Segmented, Slider, TextInput } from '../widgets/controls'
+import { MaterialField } from '../widgets/MaterialPicker'
 import { ParamEditor } from '../widgets/ParamEditor'
-import { MaskEditor } from './MaskEditor'
 
-export function PropertiesPanel() {
+/** Name and opacity - the two things every layer kind has. */
+export function LayerIdentity() {
+  const api = useApi()
+  useEngineVersion()
+  const layerId = api.activeLayerId
+  const layer = layerId ? api.getLayer(layerId) : null
+  if (!layer || !layerId) return <EmptyHint>Select a layer to edit it.</EmptyHint>
+
+  return (
+    <>
+      <TextInput label="Name" value={layer.name} onChange={(name) => api.setLayerProps(layerId, { name })} />
+      <Slider
+        label="Opacity"
+        value={layer.opacity}
+        min={0}
+        max={1}
+        onChange={(opacity) => api.setLayerProps(layerId, { opacity })}
+      />
+    </>
+  )
+}
+
+export function MaterialSection() {
   const api = useApi()
   useEngineVersion()
   const layerId = api.activeLayerId
   const layer = layerId ? api.getLayer(layerId) : null
 
-  if (!layer || !layerId) {
+  if (!layer || !layerId) return <EmptyHint>Select a layer to edit it.</EmptyHint>
+
+  if (layer.kind === 'paint') {
     return (
-      <Panel title="Properties">
-        <EmptyHint>Select a layer to edit it.</EmptyHint>
-      </Panel>
+      <EmptyHint>
+        A paint layer stores the pixels you stamp onto it. Pick a brush material in the Brush section, choose the
+        Paint tool, and draw on the model.
+      </EmptyHint>
     )
   }
 
+  if (layer.kind === 'folder') {
+    return (
+      <EmptyHint>
+        A group composites its children against everything below it, then blends the whole result through the
+        group&apos;s own opacity and mask. That is what makes a mask on a folder affect every layer inside it at once.
+      </EmptyHint>
+    )
+  }
+
+  const def = getMaterialDef(layer.material.defId)
+
   return (
-    <Panel title={`Properties — ${layer.name}`}>
-      <Field label="Name">
-        <input
-          className="w-full rounded border border-neutral-700 bg-neutral-900 px-1.5 py-1 text-[11px] text-neutral-200 focus:border-sky-600 focus:outline-none"
-          value={layer.name}
-          onChange={(e) => api.setLayerProps(layerId, { name: e.target.value })}
-        />
-      </Field>
-
-      {layer.kind === 'fill' && <FillProperties layerId={layerId} />}
-      {layer.kind === 'paint' && (
-        <EmptyHint>
-          A paint layer stores the pixels you stamp onto it. Pick a brush material in the Brush panel, choose the Paint
-          tool, and draw on the model.
-        </EmptyHint>
+    <>
+      <MaterialField
+        defId={layer.material.defId}
+        onPick={(defId) => api.setLayerMaterial(layerId, defId)}
+        hint="Every material is a shader evaluated live. Switching one rebuilds the layer stack's graph."
+      />
+      {!def ? (
+        <EmptyHint>Material “{layer.material.defId}” is not registered in this build.</EmptyHint>
+      ) : (
+        <>
+          <p className="px-2 pb-1 pt-1.5 text-[10px] leading-snug text-app-faint">{def.description}</p>
+          <ParamEditor
+            scope={`layer:${layerId}`}
+            params={def.params}
+            values={layer.material.params}
+            onChange={(key, value) => api.setMaterialParam(layerId, key, value)}
+          />
+        </>
       )}
-      {layer.kind === 'folder' && (
-        <EmptyHint>
-          A group composites its children against everything below it, then blends the whole result through the group's
-          own opacity and mask. That is what makes a mask on a folder affect every layer inside it at once.
-        </EmptyHint>
-      )}
-
-      <MaskEditor layerId={layerId} />
-    </Panel>
+    </>
   )
 }
 
-function FillProperties({ layerId }: { layerId: string }) {
+export function ProjectionSection() {
   const api = useApi()
-  const layer = api.getLayer(layerId)
-  if (!layer || layer.kind !== 'fill') return null
-  const def = getMaterialDef(layer.material.defId)
-  if (!def) return <EmptyHint>Material “{layer.material.defId}” is not registered in this build.</EmptyHint>
+  useEngineVersion()
+  const layerId = api.activeLayerId
+  const layer = layerId ? api.getLayer(layerId) : null
+
+  if (!layer || !layerId || layer.kind !== 'fill') {
+    return <EmptyHint>Projection applies to fill layers, which evaluate a material across the surface.</EmptyHint>
+  }
 
   const projection = layer.projection
 
   return (
     <>
-      <SectionHeading>Projection</SectionHeading>
-      <Select
+      <Row
         label="Mode"
-        value={projection.mode}
         hint="UV follows the mesh layout. Triplanar ignores UVs entirely and never stretches, at three times the shader cost."
-        options={PROJECTIONS.map((p) => ({ value: p, label: p }))}
-        onChange={(mode) => api.setProjection(layerId, { mode })}
-      />
-      <Slider
-        label="Tiling U"
-        value={projection.scale[0]}
-        min={0.05}
-        max={40}
-        step={0.01}
-        onChange={(value) => api.setProjection(layerId, { scale: [value, projection.scale[1]] })}
-      />
-      <Slider
-        label="Tiling V"
-        value={projection.scale[1]}
-        min={0.05}
-        max={40}
-        step={0.01}
-        onChange={(value) => api.setProjection(layerId, { scale: [projection.scale[0], value] })}
-      />
+      >
+        <div className="grid grid-cols-3 gap-[3px]">
+          {PROJECTIONS.map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => api.setProjection(layerId, { mode })}
+              className={`truncate rounded-[3px] px-1 py-[3px] text-[10px] capitalize transition-colors ${
+                projection.mode === mode
+                  ? 'bg-app-accent text-white'
+                  : 'bg-app-raised text-app-muted hover:bg-app-hover hover:text-app-text'
+              }`}
+            >
+              {mode}
+            </button>
+          ))}
+        </div>
+      </Row>
+
+      <Row label="Tiling">
+        <div className="grid grid-cols-2 gap-1.5">
+          <NumberField
+            value={projection.scale[0]}
+            min={0.05}
+            max={40}
+            step={0.01}
+            onChange={(value) => api.setProjection(layerId, { scale: [value, projection.scale[1]] })}
+          />
+          <NumberField
+            value={projection.scale[1]}
+            min={0.05}
+            max={40}
+            step={0.01}
+            onChange={(value) => api.setProjection(layerId, { scale: [projection.scale[0], value] })}
+          />
+        </div>
+      </Row>
+
+      <Row label="Offset">
+        <div className="grid grid-cols-2 gap-1.5">
+          <NumberField
+            value={projection.offset[0]}
+            min={-2}
+            max={2}
+            step={0.01}
+            onChange={(value) => api.setProjection(layerId, { offset: [value, projection.offset[1]] })}
+          />
+          <NumberField
+            value={projection.offset[1]}
+            min={-2}
+            max={2}
+            step={0.01}
+            onChange={(value) => api.setProjection(layerId, { offset: [projection.offset[0], value] })}
+          />
+        </div>
+      </Row>
+
       <Slider
         label="Rotation"
         value={projection.rotation}
@@ -96,25 +169,10 @@ function FillProperties({ layerId }: { layerId: string }) {
         step={0.001}
         onChange={(rotation) => api.setProjection(layerId, { rotation })}
       />
-      <Slider
-        label="Offset U"
-        value={projection.offset[0]}
-        min={-2}
-        max={2}
-        step={0.001}
-        onChange={(value) => api.setProjection(layerId, { offset: [value, projection.offset[1]] })}
-      />
-      <Slider
-        label="Offset V"
-        value={projection.offset[1]}
-        min={-2}
-        max={2}
-        step={0.001}
-        onChange={(value) => api.setProjection(layerId, { offset: [projection.offset[0], value] })}
-      />
+
       {projection.mode === 'triplanar' && (
         <Slider
-          label="Blend Sharpness"
+          label="Blend Sharp."
           hint="How narrow the transition between the three planes is."
           value={projection.blendSharpness}
           min={1}
@@ -123,8 +181,9 @@ function FillProperties({ layerId }: { layerId: string }) {
           onChange={(blendSharpness) => api.setProjection(layerId, { blendSharpness })}
         />
       )}
+
       {(projection.mode === 'planar' || projection.mode === 'cylindrical') && (
-        <Select
+        <Segmented
           label="Axis"
           value={projection.axis}
           options={[
@@ -135,13 +194,6 @@ function FillProperties({ layerId }: { layerId: string }) {
           onChange={(axis) => api.setProjection(layerId, { axis })}
         />
       )}
-
-      <div className="mt-1 px-3 py-1 text-[10px] leading-snug text-neutral-500">{def.description}</div>
-      <ParamEditor
-        params={def.params}
-        values={layer.material.params}
-        onChange={(key, value) => api.setMaterialParam(layerId, key, value)}
-      />
     </>
   )
 }

@@ -8,33 +8,37 @@
  * instead of being painted for one particular model.
  */
 
+import { useState } from 'react'
 import { useApi, useEngineVersion } from '../context'
 import { listGeneratorDefs, getGeneratorDef } from '../../core/procedural/generators'
 import type { GeneratorType, Levels } from '../../core/doc/types'
 import { BLEND_MODES } from '../../core/doc/types'
-import { Button, EmptyHint, SectionHeading, Select, Slider, Toggle } from '../widgets/controls'
+import { Button, EmptyHint, IconButton, Select, Slider, Toggle } from '../widgets/controls'
+import { Card, Note, ParamGroupLabel } from '../widgets/sections'
 import { ParamEditor } from '../widgets/ParamEditor'
 
-export function MaskEditor({ layerId }: { layerId: string }) {
+export function MaskSection() {
   const api = useApi()
   useEngineVersion()
-  const layer = api.getLayer(layerId)
-  if (!layer) return null
+  const layerId = api.activeLayerId
+  const layer = layerId ? api.getLayer(layerId) : null
+  if (!layer || !layerId) return <EmptyHint>Select a layer to give it a mask.</EmptyHint>
+
   const mask = layer.mask
 
   if (!mask) {
     return (
       <>
-        <SectionHeading>Mask</SectionHeading>
-        <div className="flex flex-wrap gap-1 px-3 py-2">
-          <Button onClick={() => api.addMask(layerId, { base: 1 })}>Add Mask</Button>
+        <Note>
+          A mask decides where this layer applies. Generators read the baked mesh maps, so bake first for anything
+          except plain noise.
+        </Note>
+        <div className="grid grid-cols-2 gap-1 px-2 pt-1">
+          <Button onClick={() => api.addMask(layerId, { base: 1 })}>Empty Mask</Button>
+          <Button onClick={() => api.enableMaskPainting(layerId)}>Paintable</Button>
           <Button onClick={() => api.addMask(layerId, { base: 0, generator: 'curvature' })}>Edge Wear</Button>
           <Button onClick={() => api.addMask(layerId, { base: 0, generator: 'dirt' })}>Dirt</Button>
-          <Button onClick={() => api.enableMaskPainting(layerId)}>Paintable</Button>
         </div>
-        <p className="px-3 pb-2 text-[10px] leading-snug text-neutral-500">
-          Generators read the baked mesh maps, so bake first for anything except plain noise.
-        </p>
       </>
     )
   }
@@ -43,12 +47,13 @@ export function MaskEditor({ layerId }: { layerId: string }) {
 
   return (
     <>
-      <SectionHeading>Mask</SectionHeading>
-      <div className="flex flex-wrap gap-1 px-3 py-1.5">
+      <div className="grid grid-cols-2 gap-1 px-2 pt-1">
         <Button onClick={() => api.enableMaskPainting(layerId)} disabled={mask.paintBufferId !== null}>
           {mask.paintBufferId ? 'Paintable ✓' : 'Make Paintable'}
         </Button>
-        <Button variant="danger" onClick={() => api.removeMask(layerId)}>Remove Mask</Button>
+        <Button variant="danger" onClick={() => api.removeMask(layerId)}>
+          Remove Mask
+        </Button>
       </div>
 
       <Toggle label="Enabled" value={mask.enabled} onChange={(enabled) => api.setMask(layerId, { enabled })} />
@@ -62,10 +67,7 @@ export function MaskEditor({ layerId }: { layerId: string }) {
         onChange={(base) => api.setMask(layerId, { base })}
       />
 
-      <LevelsEditor
-        levels={mask.levels}
-        onChange={(levels) => api.setMask(layerId, { levels })}
-      />
+      <LevelsEditor levels={mask.levels} onChange={(levels) => api.setMask(layerId, { levels })} />
 
       {mask.paintBufferId && (
         <>
@@ -87,8 +89,8 @@ export function MaskEditor({ layerId }: { layerId: string }) {
         </>
       )}
 
-      <SectionHeading>Generators</SectionHeading>
-      <div className="px-3 py-1.5">
+      <ParamGroupLabel>Generators</ParamGroupLabel>
+      <div className="px-2 pb-1">
         <Select
           value={'' as GeneratorType | ''}
           options={[
@@ -98,7 +100,9 @@ export function MaskEditor({ layerId }: { layerId: string }) {
               label: def.requiresBake && !baked ? `${def.name} (needs bake)` : def.name,
             })),
           ]}
-          onChange={(type) => { if (type) api.addGenerator(layerId, type as GeneratorType) }}
+          onChange={(type) => {
+            if (type) api.addGenerator(layerId, type as GeneratorType)
+          }}
         />
       </div>
 
@@ -110,29 +114,27 @@ export function MaskEditor({ layerId }: { layerId: string }) {
         const def = getGeneratorDef(generator.type)
         if (!def) return null
         return (
-          <div key={generator.id} className="mx-2 mb-2 rounded border border-neutral-800 bg-neutral-900/40">
-            <div className="flex items-center gap-1 border-b border-neutral-800 px-2 py-1">
-              <input
-                type="checkbox"
-                className="h-3 w-3 accent-sky-500"
-                checked={generator.enabled}
-                onChange={(e) => api.setGenerator(layerId, generator.id, { enabled: e.target.checked })}
-              />
-              <span className="min-w-0 flex-1 truncate text-[11px] text-neutral-200">{def.name}</span>
-              <Button
-                variant="danger"
-                title="Remove generator"
-                onClick={() => api.removeGenerator(layerId, generator.id)}
-              >
+          <Card
+            key={generator.id}
+            title={
+              <label className="flex min-w-0 items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  className="h-[11px] w-[11px] shrink-0 accent-[oklch(0.62_0.17_255)]"
+                  checked={generator.enabled}
+                  onChange={(event) => api.setGenerator(layerId, generator.id, { enabled: event.target.checked })}
+                />
+                <span className="min-w-0 truncate text-[11px] text-app-text">{def.name}</span>
+              </label>
+            }
+            actions={
+              <IconButton title="Remove generator" danger onClick={() => api.removeGenerator(layerId, generator.id)}>
                 ✕
-              </Button>
-            </div>
-            {def.requiresBake && !baked && (
-              <p className="px-2 py-1 text-[10px] text-amber-500/80">
-                Needs baked mesh maps. Run a bake to see this generator do anything.
-              </p>
-            )}
-            <p className="px-2 py-1 text-[10px] leading-snug text-neutral-500">{def.description}</p>
+              </IconButton>
+            }
+          >
+            {def.requiresBake && !baked && <Note tone="warn">Needs baked mesh maps to do anything.</Note>}
+            <Note>{def.description}</Note>
             <Select
               label="Blend"
               value={generator.blend}
@@ -156,26 +158,58 @@ export function MaskEditor({ layerId }: { layerId: string }) {
               onChange={(levels) => api.setGenerator(layerId, generator.id, { levels })}
             />
             <ParamEditor
+              scope={`gen:${generator.id}`}
               params={def.params}
               values={generator.params}
               onChange={(key, value) => api.setGenerator(layerId, generator.id, { params: { [key]: value } })}
             />
-          </div>
+          </Card>
         )
       })}
     </>
   )
 }
 
+/**
+ * Levels, collapsed by default.
+ *
+ * Five sliders appear on the mask *and* on every generator in the stack, and
+ * expanded they bury the controls people actually reach for. They matter, but
+ * they are a second pass.
+ */
 function LevelsEditor({ levels, onChange }: { levels: Levels; onChange: (levels: Partial<Levels>) => void }) {
+  const [open, setOpen] = useState(false)
+  const touched =
+    levels.inLow !== 0 || levels.inHigh !== 1 || levels.gamma !== 1 || levels.outLow !== 0 || levels.outHigh !== 1
+
   return (
-    <>
-      <SectionHeading>Levels</SectionHeading>
-      <Slider label="Input Low" value={levels.inLow} min={0} max={1} onChange={(inLow) => onChange({ inLow })} />
-      <Slider label="Input High" value={levels.inHigh} min={0} max={1} onChange={(inHigh) => onChange({ inHigh })} />
-      <Slider label="Gamma" value={levels.gamma} min={0.1} max={5} step={0.01} onChange={(gamma) => onChange({ gamma })} />
-      <Slider label="Output Low" value={levels.outLow} min={0} max={1} onChange={(outLow) => onChange({ outLow })} />
-      <Slider label="Output High" value={levels.outHigh} min={0} max={1} onChange={(outHigh) => onChange({ outHigh })} />
-    </>
+    <div>
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className="group flex w-full items-center gap-1 px-2 pb-1 pt-2.5 text-left"
+      >
+        <span
+          className={`text-app-faint transition-transform group-hover:text-app-dim ${open ? 'rotate-90' : ''}`}
+          style={{ fontSize: 7, lineHeight: 1 }}
+        >
+          ▶
+        </span>
+        <span className="text-[9px] font-semibold uppercase tracking-[0.09em] text-app-faint group-hover:text-app-dim">
+          Levels
+        </span>
+        {/* A dot, so a collapsed section still says it is doing something. */}
+        {touched && !open && <span className="h-[4px] w-[4px] rounded-full bg-app-accent" />}
+      </button>
+      {open && (
+        <>
+          <Slider label="Input Low" value={levels.inLow} min={0} max={1} onChange={(inLow) => onChange({ inLow })} />
+          <Slider label="Input High" value={levels.inHigh} min={0} max={1} onChange={(inHigh) => onChange({ inHigh })} />
+          <Slider label="Gamma" value={levels.gamma} min={0.1} max={5} step={0.01} onChange={(gamma) => onChange({ gamma })} />
+          <Slider label="Output Low" value={levels.outLow} min={0} max={1} onChange={(outLow) => onChange({ outLow })} />
+          <Slider label="Output High" value={levels.outHigh} min={0} max={1} onChange={(outHigh) => onChange({ outHigh })} />
+        </>
+      )}
+    </div>
   )
 }

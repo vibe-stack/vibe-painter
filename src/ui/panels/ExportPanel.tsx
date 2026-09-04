@@ -9,9 +9,10 @@
 import { useRef, useState } from 'react'
 import { useApi, useEngineVersion } from '../context'
 import { EXPORT_PRESETS } from '../../core/gpu/exporter'
-import { Button, Panel, SectionHeading, Select } from '../widgets/controls'
+import { Button, Select } from '../widgets/controls'
+import { Note, ParamGroupLabel } from '../widgets/sections'
 
-export function ExportPanel() {
+export function ExportSection() {
   const api = useApi()
   useEngineVersion()
   const [presetId, setPresetId] = useState(EXPORT_PRESETS[0].id)
@@ -37,41 +38,40 @@ export function ExportPanel() {
   }
 
   return (
-    <Panel title="Export & Project">
-      <SectionHeading>Texture Export</SectionHeading>
+    <>
       <Select
         label="Preset"
         value={presetId}
         options={EXPORT_PRESETS.map((p) => ({ value: p.id, label: p.name }))}
         onChange={setPresetId}
       />
-      <p className="px-3 pb-1 text-[10px] leading-snug text-neutral-500">{preset.description}</p>
-      <ul className="px-3 pb-2 text-[10px] text-neutral-600">
+      <Note>{preset.description}</Note>
+      <ul className="px-2 pb-1.5 text-[10px] text-app-faint">
         {preset.maps.map((map) => (
           <li key={map.suffix}>· {map.label}</li>
         ))}
       </ul>
-      <div className="px-3 pb-2">
-        <Button variant="primary" disabled={busy} onClick={doExport}>
+      <div className="px-2">
+        <Button variant="primary" full disabled={busy} onClick={doExport}>
           {busy ? 'Exporting…' : `Export ${preset.maps.length} PNG${preset.maps.length === 1 ? '' : 's'}`}
         </Button>
       </div>
 
-      <SectionHeading>Project</SectionHeading>
-      <p className="px-3 py-1 text-[10px] leading-snug text-neutral-500">
-        Saves the layer recipe, not pixels. Painted strokes are raster data and are not included, so a reloaded project
-        comes back with its paint layers empty.
-      </p>
-      <div className="flex flex-wrap gap-1 px-3 pb-2">
+      <ParamGroupLabel>Project</ParamGroupLabel>
+      <Note>
+        Saves the layer recipe, not pixels. Painted strokes are raster data and are not included, so a reloaded
+        project comes back with its paint layers empty.
+      </Note>
+      <div className="grid grid-cols-2 gap-1 px-2">
         <Button
           onClick={() => {
             const blob = new Blob([JSON.stringify(api.save(), null, 2)], { type: 'application/json' })
             download(blob, `${api.project.name.replace(/\s+/g, '_') || 'project'}.vibepainter.json`)
           }}
         >
-          Save Project
+          Save
         </Button>
-        <Button onClick={() => fileInput.current?.click()}>Load Project</Button>
+        <Button onClick={() => fileInput.current?.click()}>Load</Button>
         <input
           ref={fileInput}
           type="file"
@@ -91,12 +91,12 @@ export function ExportPanel() {
         />
       </div>
 
-      <SectionHeading>Smart Materials</SectionHeading>
-      <p className="px-3 py-1 text-[10px] leading-snug text-neutral-500">
+      <ParamGroupLabel>Smart Materials</ParamGroupLabel>
+      <Note>
         A smart material is a layer (usually a group) saved with its generators intact and its paint stripped, so it
         re-derives its wear from whatever mesh you apply it to.
-      </p>
-      <div className="flex flex-wrap gap-1 px-3 pb-3">
+      </Note>
+      <div className="grid grid-cols-2 gap-1 px-2">
         <Button
           disabled={!api.activeLayerId}
           onClick={() => {
@@ -131,8 +131,8 @@ export function ExportPanel() {
         />
       </div>
 
-      {message && <p className="px-3 pb-3 text-[11px] text-neutral-400">{message}</p>}
-    </Panel>
+      {message && <p className="px-2 pt-2 text-[11px] text-app-muted">{message}</p>}
+    </>
   )
 }
 

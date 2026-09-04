@@ -29,6 +29,7 @@ import {
   OneFactor,
   QuadMesh,
   Scene,
+  Vector2,
   Vector3,
 } from 'three/webgpu'
 import type { BufferGeometry, Renderer, Texture } from 'three/webgpu'
@@ -151,6 +152,47 @@ export class Painter {
   #eraseMode = uniform(0)
 
   /**
+   * The brush material, evaluated once and held as pixels for the stroke.
+   *
+   * This is the difference between painting at 60fps and painting at 4. The
+   * commit pass runs once per pointer sample, and it used to *evaluate the
+   * brush's procedural material* every time - a full triplanar rock or brick
+   * graph, over every texel of a 1024x1024 target, a hundred times per stroke.
+   * Nothing about that evaluation changes while the pointer is down: the
+   * parameters are fixed, the projection is fixed, the mesh maps are fixed, and
+   * the material is a pure function of UV. It was the same picture, recomputed
+   * from scratch, for every dab.
+   *
+   * So it is computed once at stroke start and read back as a texture. The
+   * commit pass becomes four texture reads and a lerp, which is the same work
+   * a plain colour brush was already doing - the cost of a brush no longer has
+   * anything to do with how expensive its material is.
+   *
+   * The second win is that the commit *shader* no longer contains the material
+   * at all. One commit pipeline now serves every material in the catalogue, so
+   * switching brush material costs no recompile.
+   */
+  #brushSource: SlotTargets | null = null
+  #brushSourceMaterials = new Map<string, MeshBasicNodeMaterial>()
+  /**
+   * Brush source pipelines already compiled, keyed by `#sourceKey`.
+   *
+   * Separate from `#warmed`, which is keyed by the whole stroke setup - target
+   * buffer, geometry and alpha included. A stroke only needs to know whether
+   * *this material's* pass is ready, and asking the wider set that question
+   * always answered no.
+   */
+  #warmedSources = new Set<string>()
+  /**
+   * Projection as uniforms rather than constants folded into the graph, so
+   * dragging a tiling slider re-renders the source instead of recompiling it.
+   */
+  #projScale = uniform(new Vector2(1, 1))
+  #projOffset = uniform(new Vector2(0, 0))
+  #projRotation = uniform(0)
+  #projSharpness = uniform(4)
+
+  /**
    * One stamp pipeline per brush alpha, not one pipeline with the alpha on a
    * uniform. Selecting between the five shapes with uniform weights meant
    * every stamp evaluated *all* of them - a voronoi lattice plus three fbm
@@ -172,8 +214,20 @@ export class Painter {
    */
   #mapsKey = ''
   #commitMaterials = new Map<string, MeshBasicNodeMaterial>()
-  /** Pipelines already compiled, keyed by commit key plus geometry. */
+  /** Pipelines already compiled, keyed by brush source key plus geometry. */
   #warmed = new Set<string>()
+  /**
+   * Warm-ups run one at a time, chained onto this.
+   *
+   * Every one of them borrows `#quad` to hand a material to `compileAsync`,
+   * and `sync()` asks for a warm-up on every document edit - so without a queue
+   * a burst of edits would run several at once, each reassigning the quad's
+   * material out from under the others' awaits.
+   */
+  #warmQueue: Promise<void> = Promise.resolve()
+  #warming = new Set<string>()
+  /** Resolution the lazy targets are (or will be) allocated at. */
+  #resolution: number
   /** Host scene used only to hand the commit quad to `compileAsync`. */
   #quadScene = new Scene()
   #blitter = new Blitter()
@@ -188,12 +242,35 @@ export class Painter {
     carry: number
     pending: StrokeSample[]
     painted: boolean
+    /**
+     * How many more times to re-render the brush source.
+     *
+     * Normally one draw at stroke start is enough. But WebGPU skips the first
+     * draw of a pipeline it has not finished compiling, and a skipped draw here
+     * would leave the source holding whatever was in that memory - the whole
+     * stroke would paint garbage, silently. When the pipeline was not prewarmed
+     * we simply draw it again on the next few samples, which costs a handful of
+     * evaluations instead of one per sample.
+     */
+    sourceDraws: number
   } | null = null
 
   constructor(resolution: number) {
     this.#stroke = new CoverageTarget(resolution, 'strokeCoverage')
     this.#baselineSlots = new SlotTargets(resolution, 'strokeBaseline')
     this.#baselineCoverage = new CoverageTarget(resolution, 'strokeBaselineCoverage')
+    this.#resolution = resolution
+  }
+
+  /**
+   * The brush-source target, allocated on first use.
+   *
+   * Four RGBA16F attachments is 128MB at 2K, and a session that only ever
+   * paints masks never reads a single texel of it.
+   */
+  #sourceTarget(): SlotTargets {
+    if (!this.#brushSource) this.#brushSource = new SlotTargets(this.#resolution, 'brushSource')
+    return this.#brushSource
   }
 
   get isStroking(): boolean {
@@ -204,6 +281,8 @@ export class Painter {
     this.#stroke.setSize(resolution)
     this.#baselineSlots.setSize(resolution)
     this.#baselineCoverage.setSize(resolution)
+    this.#resolution = resolution
+    this.#brushSource?.setSize(resolution)
   }
 
   /**
@@ -212,6 +291,7 @@ export class Painter {
    */
   begin(
     renderer: Renderer,
+    maps: MeshMaps,
     target: StrokeTarget,
     brush: BrushSettings,
     spec: BrushMaterialSpec,
@@ -240,9 +320,90 @@ export class Painter {
     this.#alphaContrast.value = brush.alphaContrast
     this.#strokeOpacity.value = brush.opacity
     this.#eraseMode.value = brush.erase ? 1 : 0
+    this.#applyProjection(spec.projection)
 
-    this.#active = { target, brush, spec, params, lastPoint: null, carry: 0, pending: [], painted: false }
+    const sourceKey = this.#sourceKey(spec)
+    this.#active = {
+      target,
+      brush,
+      spec,
+      params,
+      lastPoint: null,
+      carry: 0,
+      pending: [],
+      painted: false,
+      sourceDraws: this.#warmedSources.has(sourceKey) ? 1 : 3,
+    }
 
+    // Freeze the brush material into pixels for the life of the stroke.
+    if (target.kind === 'material') this.#renderBrushSource(renderer, spec, params, maps)
+  }
+
+  /** Uploads the projection controls the brush source graph reads. */
+  #applyProjection(projection: ProjectionSettings): void {
+    this.#projScale.value.set(projection.scale[0], projection.scale[1])
+    this.#projOffset.value.set(projection.offset[0], projection.offset[1])
+    this.#projRotation.value = projection.rotation
+    this.#projSharpness.value = projection.blendSharpness
+  }
+
+  /** Evaluates the brush material across UV space into `#brushSource`. */
+  #renderBrushSource(
+    renderer: Renderer,
+    spec: BrushMaterialSpec,
+    params: ParamBag,
+    maps: MeshMaps,
+  ): void {
+    const material = this.#brushSourceMaterial(spec, params, maps)
+    if (!material) return
+    renderQuad(renderer, this.#quad, material, this.#sourceTarget().rt)
+  }
+
+  /**
+   * The graph that evaluates the brush material. Structural inputs only - the
+   * material id and projection mode - so the cache survives every slider.
+   */
+  #brushSourceMaterial(
+    spec: BrushMaterialSpec,
+    params: ParamBag,
+    maps: MeshMaps,
+  ): MeshBasicNodeMaterial | null {
+    this.#syncMapsKey(maps)
+    const key = this.#sourceKey(spec)
+    const cached = this.#brushSourceMaterials.get(key)
+    if (cached) return cached
+
+    const def = getMaterialDef(spec.defId)
+    if (!def) return null
+
+    const material = new MeshBasicNodeMaterial()
+    material.depthTest = false
+    material.depthWrite = false
+    material.blending = NoBlending
+
+    const uvNode = uv()
+    const bundle = buildProjected({
+      def,
+      params,
+      mode: spec.projection.mode,
+      axis: spec.projection.axis === 'x' ? 0 : spec.projection.axis === 'y' ? 1 : 2,
+      nodes: {
+        scale: this.#projScale as unknown as V2,
+        offset: this.#projOffset as unknown as V2,
+        rotation: this.#projRotation as unknown as F,
+        sharpness: this.#projSharpness as unknown as F,
+      },
+      maps: maps.nodes(uvNode),
+      uv: uvNode,
+    })
+    material.fragmentNode = mrt(packBundle(bundle))
+
+    this.#brushSourceMaterials.set(key, material)
+    return material
+  }
+
+  #sourceKey(spec: BrushMaterialSpec): string {
+    return `${spec.defId}:${spec.projection.mode}:${spec.projection.axis}`
   }
 
   /**
@@ -272,17 +433,42 @@ export class Painter {
     // Nothing to compile against until the geometry maps exist; the engine
     // calls this again once they do.
     if (!maps.geometryBaked) return
-    const key = `${this.#commitKey(spec, target)}|${geometry.id}|${alpha}`
-    if (this.#warmed.has(key)) return
-    this.#warmed.add(key)
+    const sourceKey = this.#sourceKey(spec)
+    const key = `${sourceKey}|${target.kind}|${target.buffer.id}|${geometry.id}|${alpha}`
+    if (this.#warmed.has(key) || this.#warming.has(key)) return
+    this.#warming.add(key)
 
+    const run = this.#warmQueue.then(() => this.#warm(renderer, maps, target, spec, params, alpha, key))
+    // The queue must survive a failed warm-up, or every later one is skipped.
+    this.#warmQueue = run.catch(() => {})
+    return run
+  }
+
+  async #warm(
+    renderer: Renderer,
+    maps: MeshMaps,
+    target: StrokeTarget,
+    spec: BrushMaterialSpec,
+    params: ParamBag,
+    alpha: BrushAlpha,
+    key: string,
+  ): Promise<void> {
     try {
       this.#quadScene.add(this.#quad)
       this.#quad.material = this.#stampMaterialFor(maps, alpha)
       await compileAgainst(renderer, this.#quadScene, this.#quad.camera, this.#stroke.rt)
 
       if (target.buffer.slots) {
-        this.#quad.material = this.#commitMaterial(target, spec, params, maps)
+        // The expensive one: this is the graph that holds the whole procedural
+        // material. Compiling it here is what keeps it off the stroke.
+        const source = this.#brushSourceMaterial(spec, params, maps)
+        if (source) {
+          this.#quad.material = source
+          await compileAgainst(renderer, this.#quadScene, this.#quad.camera, this.#sourceTarget().rt)
+          this.#warmedSources.add(this.#sourceKey(spec))
+        }
+
+        this.#quad.material = this.#commitMaterial(target)
         await compileAgainst(renderer, this.#quadScene, this.#quad.camera, target.buffer.slots.rt)
       }
 
@@ -300,7 +486,11 @@ export class Painter {
           SLOT_NAMES,
         )
       }
+      // Recorded only on success. A failed or superseded warm-up must not
+      // convince the next stroke that its pipelines are ready.
+      this.#warmed.add(key)
     } finally {
+      this.#warming.delete(key)
       this.#quadScene.remove(this.#quad)
     }
   }
@@ -505,10 +695,14 @@ export class Painter {
   #commit(renderer: Renderer, maps: MeshMaps): void {
     const active = this.#active
     if (!active) return
-    const material = this.#commitMaterial(active.target, active.spec, active.params, maps)
 
     if (active.target.kind === 'material' && active.target.buffer.slots) {
-      renderQuad(renderer, this.#quad, material, active.target.buffer.slots.rt)
+      // Re-draw the source only while we are unsure the first draw landed.
+      if (active.sourceDraws > 1) {
+        active.sourceDraws--
+        this.#renderBrushSource(renderer, active.spec, active.params, maps)
+      }
+      renderQuad(renderer, this.#quad, this.#commitMaterial(active.target), active.target.buffer.slots.rt)
     }
     renderQuad(renderer, this.#quad, this.#coverageCommitMaterial(), active.target.buffer.coverage.rt)
   }
@@ -520,23 +714,24 @@ export class Painter {
     this.#mapsKey = key
     for (const material of this.#stampMaterials.values()) material.dispose()
     this.#stampMaterials.clear()
-    for (const material of this.#commitMaterials.values()) material.dispose()
-    this.#commitMaterials.clear()
+    for (const material of this.#brushSourceMaterials.values()) material.dispose()
+    this.#brushSourceMaterials.clear()
+    // The commit graph reads only render targets, so it survives a map change.
     this.#warmed.clear()
+    this.#warmedSources.clear()
   }
 
-  #commitKey(spec: BrushMaterialSpec, target: StrokeTarget): string {
-    return `${target.kind}:${target.buffer.id}:${spec.defId}:${spec.projection.mode}:${spec.projection.axis}`
-  }
-
-  #commitMaterial(
-    target: StrokeTarget,
-    spec: BrushMaterialSpec,
-    params: ParamBag,
-    maps: MeshMaps,
-  ): MeshBasicNodeMaterial {
-    this.#syncMapsKey(maps)
-    const key = this.#commitKey(spec, target)
+  /**
+   * Composites the stroke into the layer.
+   *
+   * There is exactly one of these. It reads the brush material as a texture
+   * rather than evaluating it, so nothing about this graph depends on which
+   * material the brush carries or how it is projected - picking a different
+   * material mid-session costs no recompile, and the pass costs the same
+   * whether the brush is a flat colour or a triplanar rock.
+   */
+  #commitMaterial(target: StrokeTarget): MeshBasicNodeMaterial {
+    const key = `commit:${target.kind}`
     const cached = this.#commitMaterials.get(key)
     if (cached) return cached
 
@@ -549,26 +744,8 @@ export class Painter {
     const strokeCoverage = texture(this.#stroke.texture, uvNode).x.mul(this.#strokeOpacity).clamp(0, 1)
     const baseCoverage = texture(this.#baselineCoverage.texture, uvNode).x
 
-    const def = getMaterialDef(spec.defId)
-    const brushBundle = def
-      ? buildProjected({
-          def,
-          params,
-          mode: spec.projection.mode,
-          axis: spec.projection.axis === 'x' ? 0 : spec.projection.axis === 'y' ? 1 : 2,
-          nodes: {
-            scale: vec2(spec.projection.scale[0], spec.projection.scale[1]),
-            offset: vec2(spec.projection.offset[0], spec.projection.offset[1]),
-            rotation: float(spec.projection.rotation),
-            sharpness: float(spec.projection.blendSharpness),
-          },
-          maps: maps.nodes(uvNode),
-          uv: uvNode,
-        })
-      : null
-
     const baseBundle = unpackSlots(this.#baselineSlots.rt.textures, uvNode)
-    const source = brushBundle ?? baseBundle
+    const source = unpackSlots(this.#sourceTarget().rt.textures, uvNode)
 
     // Standard "source over destination", un-premultiplied at the end so the
     // stored channel values stay meaningful where coverage is partial.
@@ -618,10 +795,13 @@ export class Painter {
     this.#stroke.dispose()
     this.#baselineSlots.dispose()
     this.#baselineCoverage.dispose()
+    this.#brushSource?.dispose()
     for (const material of this.#stampMaterials.values()) material.dispose()
     this.#stampMaterials.clear()
     for (const material of this.#commitMaterials.values()) material.dispose()
     this.#commitMaterials.clear()
+    for (const material of this.#brushSourceMaterials.values()) material.dispose()
+    this.#brushSourceMaterials.clear()
   }
 }
 

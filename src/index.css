@@ -1,7 +1,45 @@
 @import "tailwindcss";
 
+/**
+ * The interface palette.
+ *
+ * Named by *role* rather than by shade, so a control never hard-codes a step
+ * on a ramp. That matters more here than in most apps: the whole UI frames a
+ * 3D viewport, and every surface around it has to stay quieter than the model
+ * without collapsing into one flat grey. The ramp below is deliberately tight -
+ * five steps within a narrow lightness band - and separation comes from hairline
+ * borders rather than from contrast between panels.
+ *
+ * The blue is used for one thing only: what is currently selected. Nothing
+ * decorative is ever accent-coloured, so "blue" always means "this one".
+ */
 @theme {
-  --color-neutral-925: oklch(0.19 0.004 285);
+  /* Surfaces, darkest (viewport) to lightest (raised control). */
+  --color-app-void: oklch(0.145 0.004 285);
+  --color-app-bg: oklch(0.178 0.004 285);
+  --color-app-panel: oklch(0.202 0.004 285);
+  --color-app-raised: oklch(0.238 0.005 285);
+  --color-app-hover: oklch(0.272 0.006 285);
+  --color-app-active: oklch(0.315 0.007 285);
+
+  /* Hairlines. */
+  --color-app-line: oklch(0.27 0.005 285);
+  --color-app-line-strong: oklch(0.34 0.006 285);
+
+  /* Text. */
+  --color-app-text: oklch(0.93 0.003 285);
+  --color-app-muted: oklch(0.71 0.005 285);
+  --color-app-dim: oklch(0.56 0.006 285);
+  --color-app-faint: oklch(0.44 0.006 285);
+
+  /* Accent - selection only. */
+  --color-app-accent: oklch(0.62 0.17 255);
+  --color-app-accent-hi: oklch(0.7 0.16 255);
+  --color-app-accent-dim: oklch(0.34 0.09 255);
+
+  --color-app-warn: oklch(0.75 0.15 75);
+  --color-app-good: oklch(0.72 0.15 155);
+  --color-app-danger: oklch(0.65 0.19 20);
 }
 
 html,
@@ -15,6 +53,7 @@ body {
   overscroll-behavior: none;
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
+  font-size: 11px;
 }
 
 /* The viewport captures pointer input for painting; text selection while
@@ -22,4 +61,82 @@ body {
 canvas {
   touch-action: none;
   display: block;
+}
+
+/**
+ * Scrollbars sized for a tool panel rather than a document. The default macOS
+ * overlay bar is fine until a panel is 260px wide, at which point it covers a
+ * value field.
+ */
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-app-line-strong) transparent;
+}
+.scroll-thin::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background-color: var(--color-app-line-strong);
+  border: 2px solid transparent;
+  background-clip: content-box;
+  border-radius: 6px;
+}
+.scroll-thin::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-app-dim);
+}
+
+/**
+ * Number fields that scrub.
+ *
+ * The cursor has to change on the *label*, which is the drag handle, so this is
+ * a class rather than an inline style - and it has to survive the pointer
+ * capture that the drag installs, which inline styles on a hovered element do
+ * not reliably do.
+ */
+.scrub {
+  cursor: ew-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+/* A slider track we draw ourselves; the native one cannot be made this small
+   consistently across engines. */
+.track {
+  appearance: none;
+  background: transparent;
+}
+.track::-webkit-slider-thumb {
+  appearance: none;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--color-app-text);
+  border: none;
+  margin-top: -4px;
+  cursor: grab;
+}
+.track::-webkit-slider-thumb:active {
+  cursor: grabbing;
+}
+.track::-moz-range-thumb {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--color-app-text);
+  border: none;
+  cursor: grab;
+}
+.track::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--color-app-raised);
+}
+.track::-moz-range-track {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--color-app-raised);
 }

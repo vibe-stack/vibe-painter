@@ -10,23 +10,18 @@ import { useRef, useState } from 'react'
 import { useApi, useEngineVersion } from '../context'
 import { ENVIRONMENT_PRESETS } from '../../core/gpu/environment'
 import { GLTF_ACCEPT, isGltfFileName } from '../../core/mesh/gltf'
-import { Button, Panel, SectionHeading, Select, Slider } from '../widgets/controls'
+import { Button, Row, Select, Slider } from '../widgets/controls'
+import { Note, ParamGroupLabel } from '../widgets/sections'
 
 const RESOLUTIONS = [256, 512, 1024, 2048]
 
-export function ScenePanel() {
+export function MeshSection() {
   const api = useApi()
   useEngineVersion()
-  const [preset, setPreset] = useState('studio')
   const [importing, setImporting] = useState(false)
   const [importNote, setImportNote] = useState<string | null>(null)
   const [dropActive, setDropActive] = useState(false)
   const fileInput = useRef<HTMLInputElement>(null)
-  // Read straight off the engine rather than mirroring it into React state:
-  // two copies of the same value is exactly how controls drift out of sync.
-  const heightScale = api.engine.heightScale
-  const normalScale = api.engine.normalScale
-  const env = api.engine.environmentSettings
   const status = api.status()
   const mesh = api.project.meshes[0]
   const activePrimitive = mesh?.source.kind === 'primitive' ? mesh.source.preset : null
@@ -53,27 +48,32 @@ export function ScenePanel() {
   }
 
   return (
-    <Panel title="Scene">
-      <SectionHeading>Mesh</SectionHeading>
-      <div className="grid grid-cols-2 gap-1 px-3 py-1.5">
+    <>
+      <div className="grid grid-cols-3 gap-1 px-2 py-1">
         {api.listPrimitives().map((primitive) => (
-          <Button
+          <button
             key={primitive.id}
-            variant={activePrimitive === primitive.id ? 'primary' : 'default'}
+            type="button"
             title={primitive.description}
             disabled={importing}
             onClick={() => {
               api.setMesh(primitive.id)
               setImportNote(null)
             }}
+            className={`truncate rounded-[3px] px-1 py-[3px] text-[10px] transition-colors disabled:opacity-40 ${
+              activePrimitive === primitive.id
+                ? 'bg-app-accent text-white'
+                : 'bg-app-raised text-app-muted hover:bg-app-hover hover:text-app-text'
+            }`}
           >
             {primitive.name}
-          </Button>
+          </button>
         ))}
       </div>
+
       <div
-        className={`mx-3 mb-1 rounded border border-dashed px-3 py-2 ${
-          dropActive ? 'border-sky-500 bg-sky-950/40' : 'border-neutral-700 bg-neutral-900/40'
+        className={`mx-2 mt-1 rounded-[4px] border border-dashed px-2 py-2 transition-colors ${
+          dropActive ? 'border-app-accent bg-app-accent-dim/25' : 'border-app-line-strong bg-app-bg'
         }`}
         onDragOver={(event) => {
           event.preventDefault()
@@ -88,11 +88,11 @@ export function ScenePanel() {
         }}
       >
         <div className="flex items-center justify-between gap-2">
-          <p className="text-[10px] leading-snug text-neutral-500">
-            {importing ? 'Importing…' : 'Any .glb / .gltf, or pick a primitive above.'}
+          <p className="min-w-0 flex-1 text-[10px] leading-snug text-app-faint">
+            {importing ? 'Importing…' : 'Drop a .glb / .gltf here'}
           </p>
           <Button disabled={importing} onClick={() => fileInput.current?.click()}>
-            Import GLB
+            Browse
           </Button>
         </div>
         <input
@@ -107,32 +107,50 @@ export function ScenePanel() {
           }}
         />
       </div>
-      <p className="px-3 pb-2 text-[10px] text-neutral-500">
-        {mesh?.source.kind === 'imported' ? mesh.source.fileName : mesh?.name ?? 'Mesh'}
+
+      <Note>
+        {mesh?.source.kind === 'imported' ? mesh.source.fileName : (mesh?.name ?? 'Mesh')}
         {' · '}
         {status.meshTriangles.toLocaleString()} triangles
         {' · '}
         geometry maps {status.geometryBaked ? 'ready' : 'pending'}
-      </p>
-      {importNote && <p className="px-3 pb-2 text-[10px] leading-snug text-amber-400">{importNote}</p>}
+      </Note>
+      {importNote && <Note tone="warn">{importNote}</Note>}
 
-      <SectionHeading>Texture Resolution</SectionHeading>
-      <div className="flex gap-1 px-3 py-1.5">
+      <ParamGroupLabel>Texture Resolution</ParamGroupLabel>
+      <div className="grid grid-cols-4 gap-1 px-2">
         {RESOLUTIONS.map((size) => (
-          <Button
+          <button
             key={size}
-            variant={status.resolution === size ? 'primary' : 'default'}
+            type="button"
             onClick={() => api.setResolution(size)}
+            className={`rounded-[3px] px-1 py-[3px] text-[10px] tabular-nums transition-colors ${
+              status.resolution === size
+                ? 'bg-app-accent text-white'
+                : 'bg-app-raised text-app-muted hover:bg-app-hover hover:text-app-text'
+            }`}
           >
             {size}
-          </Button>
+          </button>
         ))}
       </div>
-      <p className="px-3 pb-2 text-[10px] leading-snug text-neutral-500">
-        Changing this reallocates every channel target and clears painted pixels.
-      </p>
+      <Note>Changing this reallocates every channel target and clears painted pixels.</Note>
+    </>
+  )
+}
 
-      <SectionHeading>Lighting</SectionHeading>
+export function LightingSection() {
+  const api = useApi()
+  useEngineVersion()
+  const [preset, setPreset] = useState('studio')
+  const env = api.engine.environmentSettings
+  // Read straight off the engine rather than mirroring it into React state:
+  // two copies of the same value is exactly how controls drift out of sync.
+  const heightScale = api.engine.heightScale
+  const normalScale = api.engine.normalScale
+
+  return (
+    <>
       <Select
         label="Environment"
         value={preset}
@@ -143,12 +161,28 @@ export function ScenePanel() {
         }}
       />
       <Slider label="Intensity" value={env.intensity} min={0} max={3} step={0.01} onChange={(intensity) => api.setEnvironment({ intensity })} />
-      <Slider label="Sun Elevation" value={env.sunElevation} min={-10} max={90} step={0.5} onChange={(sunElevation) => api.setEnvironment({ sunElevation })} />
-      <Slider label="Sun Azimuth" value={env.sunAzimuth} min={0} max={360} step={1} onChange={(sunAzimuth) => api.setEnvironment({ sunAzimuth })} />
+      <Slider label="Sun Elevation" value={env.sunElevation} min={-10} max={90} step={0.5} suffix="°" onChange={(sunElevation) => api.setEnvironment({ sunElevation })} />
+      <Slider label="Sun Azimuth" value={env.sunAzimuth} min={0} max={360} step={1} suffix="°" onChange={(sunAzimuth) => api.setEnvironment({ sunAzimuth })} />
       <Slider label="Sun Intensity" value={env.sunIntensity} min={0} max={30} step={0.1} onChange={(sunIntensity) => api.setEnvironment({ sunIntensity })} />
       <Slider label="Cloud Cover" value={env.clouds} min={0} max={1} step={0.01} onChange={(clouds) => api.setEnvironment({ clouds })} />
 
-      <SectionHeading>Display</SectionHeading>
+      <ParamGroupLabel>Display</ParamGroupLabel>
+      <Row label="Background" hint="Hides the generated sky without turning off the lighting it provides.">
+        <button
+          type="button"
+          role="switch"
+          aria-checked={api.engine.showBackground}
+          onClick={() => api.engine.setShowBackground(!api.engine.showBackground)}
+          className={`relative h-[15px] w-[26px] shrink-0 rounded-full transition-colors ${
+            api.engine.showBackground ? 'bg-app-accent' : 'bg-app-raised hover:bg-app-hover'
+          }`}
+        >
+          <span
+            className="absolute top-[2px] h-[11px] w-[11px] rounded-full bg-white transition-all"
+            style={{ left: api.engine.showBackground ? 13 : 2 }}
+          />
+        </button>
+      </Row>
       <Slider
         label="Height Relief"
         hint="How strongly the height channel perturbs the shading normal in the viewport."
@@ -166,6 +200,6 @@ export function ScenePanel() {
         step={0.01}
         onChange={(value) => api.engine.setNormalScale(value)}
       />
-    </Panel>
+    </>
   )
 }

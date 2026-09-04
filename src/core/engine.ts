@@ -575,7 +575,7 @@ export class Engine {
     // duration, so each pointer sample does not re-evaluate the whole
     // procedural stack. See `Compositor#below`.
     if (this.activeLayer && !(globalThis as unknown as { __nosplit?: boolean }).__nosplit) this.#compositor.splitBelow(this.activeLayer.id)
-    this.#painter.begin(renderer, target, this.#brush, {
+    this.#painter.begin(renderer, this.#meshMaps, target, this.#brush, {
       defId: this.#brushMaterial.defId,
       params: this.#brushMaterial.params,
       projection: this.#brushProjection,
