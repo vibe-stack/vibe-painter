@@ -10,6 +10,9 @@ import tailwindcss from '@tailwindcss/vite'
 // and a refresh did not. Alias the bare specifier only; `three/tsl` and
 // `three/addons` must keep resolving to their own entry points.
 export default defineConfig({
+  // Project Pages URL: https://vibe-stack.github.io/vibe-painter/
+  // Keep `/` in `vite` so local dev is unchanged; `vite preview` is production.
+  base: process.env.NODE_ENV === 'production' ? '/vibe-painter/' : '/',
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: [{ find: /^three$/, replacement: 'three/webgpu' }],
