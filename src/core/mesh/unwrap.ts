@@ -16,6 +16,7 @@
 
 import { BufferAttribute, BufferGeometry } from 'three/webgpu'
 import type { InterleavedBufferAttribute } from 'three/webgpu'
+import { PART_ID_ATTRIBUTE } from './parts'
 
 type Attr = BufferAttribute | InterleavedBufferAttribute
 
@@ -39,7 +40,7 @@ export function uniqueUnwrap(geometry: BufferGeometry): BufferGeometry {
 
   const weld = weldByPosition(position)
   const faces = buildFaces(position, faceCount)
-  const islands = growIslands(faces, weld, vertexCount)
+  const islands = growIslands(faces, weld, vertexCount, geo.getAttribute(PART_ID_ATTRIBUTE))
 
   const charts: Chart[] = []
   for (const members of islands) {
@@ -168,16 +169,19 @@ function buildFaces(position: Attr, faceCount: number): Face[] {
   return faces
 }
 
-function growIslands(faces: Face[], weld: Int32Array, vertexCount: number): number[][] {
+function growIslands(faces: Face[], weld: Int32Array, vertexCount: number, partId: Attr | undefined): number[][] {
   const faceCount = faces.length
   const neighbors = adjacency(weld, faceCount, vertexCount)
   const visited = new Uint8Array(faceCount)
   const islands: number[][] = []
+  const partOf = (face: number): number =>
+    partId ? Math.round(partId.getX(face * 3)) : 0
 
   for (let seed = 0; seed < faceCount; seed++) {
     if (visited[seed]) continue
     const members: number[] = []
     const snx = faces[seed].nx, sny = faces[seed].ny, snz = faces[seed].nz
+    const seedPart = partOf(seed)
     const stack = [seed]
     visited[seed] = 1
     while (stack.length > 0) {
@@ -187,6 +191,7 @@ function growIslands(faces: Face[], weld: Int32Array, vertexCount: number): numb
       for (let i = 0; i < adj.length; i++) {
         const n = adj[i]
         if (visited[n]) continue
+        if (partOf(n) !== seedPart) continue
         if (faces[n].nx * snx + faces[n].ny * sny + faces[n].nz * snz < ANGLE_LIMIT_COS) continue
         visited[n] = 1
         stack.push(n)
@@ -195,6 +200,52 @@ function growIslands(faces: Face[], weld: Int32Array, vertexCount: number): numb
     islands.push(members)
   }
   return islands
+}
+
+/**
+ * Pulls island-border UVs inward so a bilinear tap at a seam vertex stays
+ * inside the chart instead of mixing with the empty gutter or a neighbour.
+ */
+export function insetUvBorders(geometry: BufferGeometry, amount: number): void {
+  const uv = geometry.getAttribute('uv')
+  if (!uv || amount <= 0) return
+  const index = geometry.getIndex()
+  const triCount = Math.floor((index ? index.count : uv.count) / 3)
+  if (triCount === 0) return
+
+  const du = new Float32Array(uv.count)
+  const dv = new Float32Array(uv.count)
+  const weight = new Float32Array(uv.count)
+
+  for (let t = 0; t < triCount; t++) {
+    const i0 = index ? index.getX(t * 3) : t * 3
+    const i1 = index ? index.getX(t * 3 + 1) : t * 3 + 1
+    const i2 = index ? index.getX(t * 3 + 2) : t * 3 + 2
+    const u0 = uv.getX(i0), v0 = uv.getY(i0)
+    const u1 = uv.getX(i1), v1 = uv.getY(i1)
+    const u2 = uv.getX(i2), v2 = uv.getY(i2)
+    const cu = (u0 + u1 + u2) / 3
+    const cv = (v0 + v1 + v2) / 3
+    const verts = [i0, i1, i2]
+    const us = [u0, u1, u2]
+    const vs = [v0, v1, v2]
+    for (let k = 0; k < 3; k++) {
+      const dx = cu - us[k]
+      const dy = cv - vs[k]
+      const len = Math.hypot(dx, dy)
+      if (len < 1e-12) continue
+      const move = Math.min(amount, len * 0.35)
+      du[verts[k]] += (dx / len) * move
+      dv[verts[k]] += (dy / len) * move
+      weight[verts[k]] += 1
+    }
+  }
+
+  for (let i = 0; i < uv.count; i++) {
+    if (weight[i] === 0) continue
+    uv.setXY(i, uv.getX(i) + du[i] / weight[i], uv.getY(i) + dv[i] / weight[i])
+  }
+  uv.needsUpdate = true
 }
 
 function adjacency(weld: Int32Array, faceCount: number, vertexCount: number): number[][] {

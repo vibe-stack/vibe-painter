@@ -24,7 +24,7 @@ import { attributeToFloat32, compactGeometryAttributes } from './attributes'
 import type { MeshPart, MeshPiece } from './parts'
 import { assignPartIds, attachMeshParts } from './parts'
 import { prepareGeometry } from './tangents'
-import { uniqueUnwrap, uvsOverlap } from './unwrap'
+import { insetUvBorders, uniqueUnwrap, uvsOverlap } from './unwrap'
 
 export interface ImportedGltf {
   geometry: BufferGeometry
@@ -126,6 +126,7 @@ export async function loadGltfGeometry(source: File | Blob | ArrayBuffer, fileNa
     generatedUVs = true
   }
   fitToOrigin(geometry)
+  insetUvBorders(geometry, 0.003)
   prepareGeometry(geometry)
   attachMeshParts(geometry, assignment.parts)
 

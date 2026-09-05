@@ -331,6 +331,9 @@ export class Engine {
     }
 
     const changed = this.#compositor.render(renderer, set, this.#meshMaps, this.#paintBuffers)
+    if (changed && !this.#painter.isStroking && this.#meshMaps.geometryBaked) {
+      this.#dilator.dilateComposite(renderer, this.#compositor.output, this.#meshMaps.islandMask.texture, 8)
+    }
 
     if (this.#needsViewportRebuild) {
       measure('viewport material rebuild', () => {
@@ -741,7 +744,7 @@ export class Engine {
   endStroke(): void {
     const renderer = this.#renderer
     if (!renderer) return
-    const painted = this.#painter.end(renderer, this.#dilator, 4, this.#meshMaps.islandMask.texture)
+    const painted = this.#painter.end(renderer, this.#dilator, 16, this.#meshMaps.islandMask.texture)
     if (painted) {
       this.#compositeNow()
       this.events.emit('documentChanged', { reason: 'stroke' })
@@ -756,6 +759,9 @@ export class Engine {
     if (!renderer || !set) return
     this.#compositor.invalidate()
     this.#compositor.render(renderer, set, this.#meshMaps, this.#paintBuffers)
+    if (this.#meshMaps.geometryBaked) {
+      this.#dilator.dilateComposite(renderer, this.#compositor.output, this.#meshMaps.islandMask.texture, 8)
+    }
   }
 
   get brushProjection(): ProjectionSettings {

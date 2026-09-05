@@ -94,7 +94,12 @@ export class MeshMaps {
     GEOMETRY_MAP_NAMES.forEach((name, i) => {
       this.geometry.textures[i].name = name
     })
-    this.islandMask = new RenderTarget(resolution, resolution, { ...CHANNEL_TARGET_OPTIONS, format: RedFormat })
+    this.islandMask = new RenderTarget(resolution, resolution, {
+      ...CHANNEL_TARGET_OPTIONS,
+      format: RedFormat,
+      minFilter: NearestFilter,
+      magFilter: NearestFilter,
+    })
     this.islandMask.texture.name = 'islandMask'
     this.idMap = new RenderTarget(resolution, resolution, {
       ...CHANNEL_TARGET_OPTIONS,
