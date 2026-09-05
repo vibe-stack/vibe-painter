@@ -29,6 +29,7 @@ import { DEFAULT_BRUSH } from './gpu/painter'
 import { PaintBuffer } from './gpu/targets'
 import { initialisePaintBuffer } from './gpu/clear'
 import { clearTarget } from './gpu/uvspace'
+import { measure } from './gpu/profile'
 import { ViewportMaterials } from './gpu/viewport'
 import type { ViewMode } from './gpu/viewport'
 import { IdWireframe } from './gpu/idoverlay'
@@ -332,8 +333,10 @@ export class Engine {
     const changed = this.#compositor.render(renderer, set, this.#meshMaps, this.#paintBuffers)
 
     if (this.#needsViewportRebuild) {
-      this.#viewport.build(this.#compositor.output, this.#meshMaps)
-      this.#viewport.setMode(this.#viewMode)
+      measure('viewport material rebuild', () => {
+        this.#viewport.build(this.#compositor.output, this.#meshMaps)
+        this.#viewport.setMode(this.#viewMode)
+      })
       this.#needsViewportRebuild = false
       this.#applyViewMode()
     }
@@ -472,10 +475,10 @@ export class Engine {
     const renderer = this.#renderer
     const geometry = this.geometry
     if (!renderer || !geometry) return
-    this.#geometryBaker.bake(renderer, geometry, this.#meshMaps)
+    measure('geometry bake', () => this.#geometryBaker.bake(renderer, geometry, this.#meshMaps))
     // Without dilation the gutter is empty, and bilinear filtering pulls it
     // into every island edge as a dark rim.
-    this.#dilator.dilateGeometry(renderer, this.#meshMaps, 16)
+    measure('geometry dilation', () => this.#dilator.dilateGeometry(renderer, this.#meshMaps, 16))
     if (options.rebuildGraph === false) this.#compositor.invalidate()
     else this.#compositor.invalidateGraph()
     // The brush graphs read these maps, so they have to be rebuilt too.

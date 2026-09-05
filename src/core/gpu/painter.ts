@@ -67,6 +67,7 @@ import { packBundle, unpackSlots } from './packing'
 import { CoverageTarget, SlotTargets } from './targets'
 import type { PaintBuffer } from './targets'
 import { vec4ArrayUniform } from './bindings'
+import { measure, measureAsync } from './profile'
 import { clearTarget, compileAgainst, renderQuad } from './uvspace'
 import { Blitter } from './blit'
 import type { Dilator } from './dilate'
@@ -383,7 +384,7 @@ export class Painter {
   ): void {
     const material = this.#brushSourceMaterial(spec, params, maps)
     if (!material) return
-    renderQuad(renderer, this.#quad, material, this.#sourceTarget().rt)
+    measure('brush source draw', () => renderQuad(renderer, this.#quad, material, this.#sourceTarget().rt))
   }
 
   /**
@@ -465,7 +466,9 @@ export class Painter {
     if (this.#warmed.has(key) || this.#warming.has(key)) return
     this.#warming.add(key)
 
-    const run = this.#warmQueue.then(() => this.#warm(renderer, maps, target, spec, params, alpha, key))
+    const run = this.#warmQueue.then(() =>
+      measureAsync('brush prewarm', () => this.#warm(renderer, maps, target, spec, params, alpha, key)),
+    )
     // The queue must survive a failed warm-up, or every later one is skipped.
     this.#warmQueue = run.catch(() => {})
     return run
@@ -598,7 +601,9 @@ export class Painter {
         nrmValue.set(n[0], n[1], n[2], lerp(1, pressure, active.brush.pressureFlow))
       }
       this.#stampCount.value = batch.length
-      renderQuad(renderer, this.#quad, this.#stampMaterialFor(maps, active.brush.alpha), this.#stroke.rt)
+      measure('brush stamp draw', () =>
+        renderQuad(renderer, this.#quad, this.#stampMaterialFor(maps, active.brush.alpha), this.#stroke.rt),
+      )
     }
     active.pending.length = 0
     active.painted = true
@@ -768,9 +773,13 @@ export class Painter {
         active.sourceDraws--
         this.#renderBrushSource(renderer, active.spec, active.params, maps)
       }
-      renderQuad(renderer, this.#quad, this.#commitMaterial(active.target), active.target.buffer.slots.rt)
+      measure('brush commit draw', () =>
+        renderQuad(renderer, this.#quad, this.#commitMaterial(active.target), active.target.buffer.slots!.rt),
+      )
     }
-    renderQuad(renderer, this.#quad, this.#coverageCommitMaterial(), active.target.buffer.coverage.rt)
+    measure('brush coverage draw', () =>
+      renderQuad(renderer, this.#quad, this.#coverageCommitMaterial(), active.target.buffer.coverage.rt),
+    )
   }
 
   /** Drops every cached graph if the mesh maps it was built against changed. */

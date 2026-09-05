@@ -53,6 +53,7 @@ import type { PaintBuffer } from './targets'
 import { SlotTargets } from './targets'
 import { blurredCoverage } from './sampling'
 import { renderQuad } from './uvspace'
+import { measure, measureAsync } from './profile'
 import { yieldToBrowser } from './scheduler'
 
 interface BuildContext {
@@ -97,6 +98,26 @@ export class Compositor {
   #rebuilding = false
   /** Set when the live graph references something about to stop existing. */
   #rebuildImmediate = false
+  /**
+   * Whether a usable graph has ever been built.
+   *
+   * Only the very first build has nothing on screen to fall back to, so it is
+   * the only one allowed to block the main thread. Everything after it can be
+   * built asynchronously while the composite target keeps showing its last
+   * frame.
+   */
+  #everBuilt = false
+  /**
+   * Consecutive failed asynchronous rebuilds.
+   *
+   * The asynchronous path is better in every way *when it works*. If it stops
+   * working - a driver that rejects `createRenderPipelineAsync`, a compile that
+   * throws - then retrying it forever would leave the viewport permanently
+   * stale, which is worse than a stall. After a couple of failures the inline
+   * path takes over and accepts the hitch.
+   */
+  #asyncFailures = 0
+  static readonly #MAX_ASYNC_FAILURES = 2
   /** Host scene, used only to hand the quad to `compileAsync`. */
   #quadScene = new Scene()
 
@@ -132,6 +153,10 @@ export class Compositor {
     if (resolution === this.output.resolution) return
     this.output.setSize(resolution)
     this.#below?.setSize(resolution)
+    // Resizing reallocates the target, so its contents are no longer the last
+    // good frame - there is nothing worth showing while a replacement builds,
+    // which is exactly the condition that earns a blocking rebuild.
+    this.#everBuilt = false
     // The attachment formats the compiled pipeline was built against are gone.
     this.invalidateGraph({ immediate: true })
   }
@@ -208,23 +233,38 @@ export class Compositor {
   render(renderer: Renderer, set: TextureSetState, maps: MeshMaps, buffers: Map<string, PaintBuffer>): boolean {
     if (this.#needsRebuild) {
       this.#needsRebuild = false
-      // Two reasons to build inline: there is nothing on screen yet to keep
-      // showing, or what is on screen is about to reference a dead texture.
-      if (!this.#material || this.#rebuildImmediate) {
-        this.#rebuildImmediate = false
+      const immediate = this.#rebuildImmediate
+      this.#rebuildImmediate = false
+
+      // Building inline means the next draw creates the pipeline, and pipeline
+      // creation for a fused stack shader is however long the driver takes -
+      // hundreds of milliseconds of blocked main thread, with no yield in it.
+      // So it is reserved for the two cases where there is genuinely nothing
+      // valid to show in the meantime.
+      if (!this.#everBuilt || this.#asyncFailures >= Compositor.#MAX_ASYNC_FAILURES) {
         // Supersede anything in flight, so a build that started before the
         // resources changed cannot overwrite this one when it lands.
         this.#buildToken++
-        this.#applyBuild(this.#buildGraph(set, maps, buffers))
+        this.#applyBuild(measure('composite graph build (inline)', () => this.#buildGraph(set, maps, buffers)))
         // The new pipeline's first draw is skipped; autoClear would leave the
         // target black and a single composite would never recover.
         this.#rebuildDraws = 3
-      } else if (!this.#rebuilding) {
-        void this.#rebuildAsync(renderer, set, maps, buffers)
+        this.#asyncFailures = 0
       } else {
-        // A build is already running against older state. Ask again next frame
-        // rather than starting a second one alongside it.
-        this.#needsRebuild = true
+        // An immediate invalidation means the live graph samples something that
+        // is being disposed, so it must stop drawing now. That used to force an
+        // inline rebuild - but the composite target still holds the last good
+        // frame and the viewport goes on sampling it, so retiring the graph and
+        // building the replacement off the frame shows a few stale frames
+        // instead of freezing the application.
+        if (immediate) this.#retire()
+        if (this.#rebuilding) {
+          // A build is already running against older state. Ask again next
+          // frame rather than starting a second one alongside it.
+          this.#needsRebuild = true
+        } else {
+          void this.#rebuildAsync(renderer, set, maps, buffers)
+        }
       }
     }
     if (!this.#material) return false
@@ -234,11 +274,13 @@ export class Compositor {
     // warming, because a skipped draw would leave the cache holding whatever
     // was in that memory.
     if (this.#belowMaterial && this.#below && (!this.#belowValid || this.#rebuildDraws > 0)) {
-      renderQuad(renderer, this.#quad, this.#belowMaterial, this.#below.rt)
+      measure('frozen lower-stack draw', () =>
+        renderQuad(renderer, this.#quad, this.#belowMaterial!, this.#below!.rt),
+      )
       this.#belowValid = true
     }
 
-    renderQuad(renderer, this.#quad, this.#material!, this.output.rt)
+    measure('composite draw', () => renderQuad(renderer, this.#quad, this.#material!, this.output.rt))
     this.#needsComposite = false
     if (this.#rebuildDraws > 0) {
       this.#rebuildDraws--
@@ -330,6 +372,27 @@ export class Compositor {
     this.#belowMaterial = built.belowMaterial
     this.#belowValid = false
     this.#needsComposite = true
+    this.#everBuilt = true
+  }
+
+  /**
+   * Drops the live graph without putting anything in its place.
+   *
+   * For when the textures it samples are about to be disposed: it must not draw
+   * again, and the output target's last frame is a better thing to leave on
+   * screen than a black one - or than a stalled one, which is what building the
+   * replacement inline costs.
+   */
+  #retire(): void {
+    // Supersede anything in flight: it was built against resources that are
+    // going away, so its result must not land.
+    this.#buildToken++
+    this.#material?.dispose()
+    this.#belowMaterial?.dispose()
+    this.#material = null
+    this.#belowMaterial = null
+    this.#belowValid = false
+    this.#needsComposite = true
   }
 
   /**
@@ -356,27 +419,36 @@ export class Compositor {
       await yieldToBrowser()
       if (token !== this.#buildToken) return
 
-      built = this.#buildGraph(set, maps, buffers)
+      built = measure('composite graph build', () => this.#buildGraph(set, maps, buffers))
       // Checked again here: an immediate invalidation during the build means
       // the textures this graph samples may already be gone, and there is no
       // point handing them to the driver.
       if (token !== this.#buildToken) return
-      await this.#precompile(renderer, built.material, this.output.rt)
+      await measureAsync('composite precompile', () => this.#precompile(renderer, built!.material, this.output.rt))
       if (built.belowMaterial && this.#below) {
-        await this.#precompile(renderer, built.belowMaterial, this.#below.rt)
+        await measureAsync('frozen lower-stack precompile', () =>
+          this.#precompile(renderer, built!.belowMaterial!, this.#below!.rt),
+        )
       }
       if (token !== this.#buildToken) return
 
       this.#applyBuild(built)
       built = null
+      this.#asyncFailures = 0
       // The pipeline is already compiled, so this draw will not be skipped -
       // but a spare costs one fullscreen pass and a missed one costs a black
       // texture set until the next edit.
       this.#rebuildDraws = 2
     } catch (cause) {
-      console.warn('[vibe-painter] deferred composite rebuild failed, retrying inline', cause)
-      // Fall back to the inline path, which cannot be skipped or superseded.
-      this.#rebuildImmediate = true
+      this.#asyncFailures++
+      // Retried asynchronously, not inline. Falling straight back to the
+      // blocking path meant a single flaky compile turned every later edit into
+      // a frozen frame; only a repeated failure is worth paying that for, and
+      // `#MAX_ASYNC_FAILURES` is where that line is drawn.
+      console.warn(
+        `[vibe-painter] deferred composite rebuild failed (${this.#asyncFailures} in a row)`,
+        cause,
+      )
       this.#needsRebuild = true
       this.#needsComposite = true
     } finally {
@@ -402,7 +474,9 @@ export class Compositor {
     let compiled: Promise<void>
     try {
       renderer.setRenderTarget(target)
-      compiled = renderer.compileAsync(this.#quadScene, this.#quad.camera)
+      compiled = measure('compileAsync prologue', () =>
+        renderer.compileAsync(this.#quadScene, this.#quad.camera),
+      )
     } finally {
       renderer.setRenderTarget(previous)
       this.#quadScene.remove(this.#quad)
