@@ -60,6 +60,9 @@ export function deserializeProject(input: unknown): ProjectFile {
     throw new Error(`Project file version ${file.version} is newer than this build understands`)
   }
   if (!file.project) throw new Error('Project file has no project')
+  for (const mesh of file.project.meshes ?? []) {
+    if (!mesh.parts) mesh.parts = []
+  }
   return {
     format: 'vibe-painter-project',
     version: file.version,

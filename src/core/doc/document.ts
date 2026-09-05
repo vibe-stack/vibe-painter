@@ -16,6 +16,7 @@ import type {
   Levels,
   MaskState,
   MaterialInstance,
+  MeshPart,
   MeshState,
   PaintLayerState,
   ProjectState,
@@ -54,8 +55,14 @@ export function createTextureSet(meshId: string, name = 'Texture Set', resolutio
   }
 }
 
-export function createMesh(source: MeshState['source'], name: string, triangleCount: number, hasUVs: boolean): MeshState {
-  return { id: uid('mesh'), name, source, triangleCount, hasUVs }
+export function createMesh(
+  source: MeshState['source'],
+  name: string,
+  triangleCount: number,
+  hasUVs: boolean,
+  parts: MeshPart[] = [],
+): MeshState {
+  return { id: uid('mesh'), name, source, triangleCount, hasUVs, parts }
 }
 
 export function createFillLayer(material: MaterialInstance, name = 'Fill'): FillLayerState {

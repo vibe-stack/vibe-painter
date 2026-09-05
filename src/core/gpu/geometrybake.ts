@@ -11,6 +11,7 @@
 import { MeshBasicNodeMaterial, NoBlending, NodeMaterial, QuadMesh, Vector3 } from 'three/webgpu'
 import type { BufferGeometry, Renderer } from 'three/webgpu'
 import {
+  attribute,
   mrt,
   modelNormalMatrix,
   modelWorldMatrix,
@@ -24,7 +25,9 @@ import {
   uv,
   vec4,
 } from 'three/tsl'
+import { PART_ID_ATTRIBUTE } from '../mesh/parts'
 import { GEOMETRY_MAP_NAMES, MeshMaps } from './meshmaps'
+import type { F } from './nodes'
 import { UVSpacePass, renderQuad, uvClipPosition } from './uvspace'
 
 export class GeometryBaker {
@@ -32,6 +35,7 @@ export class GeometryBaker {
   #quad = new QuadMesh()
   #material: NodeMaterial | null = null
   #maskMaterial: MeshBasicNodeMaterial | null = null
+  #idMaterial: NodeMaterial | null = null
   #bboxMin = uniform(new Vector3(0, 0, 0))
   #bboxSize = uniform(new Vector3(1, 1, 1))
 
@@ -93,8 +97,26 @@ export class GeometryBaker {
     // Snapshot which texels are real surface *before* dilation floods the
     // coverage channel outward. Paint padding needs this unflooded answer.
     this.#captureIslandMask(renderer, maps)
+    this.#bakeIdMap(renderer, geometry, maps)
     maps.markGeometryBaked(min, max)
     return { min, max }
+  }
+
+  #buildIdMaterial(): NodeMaterial {
+    if (this.#idMaterial) return this.#idMaterial
+    const material = new NodeMaterial()
+    material.vertexNode = uvClipPosition()
+    material.depthTest = false
+    material.depthWrite = false
+    material.blending = NoBlending
+    const id = attribute(PART_ID_ATTRIBUTE, 'float') as unknown as F
+    material.fragmentNode = vec4(id, 0, 0, 1)
+    this.#idMaterial = material
+    return material
+  }
+
+  #bakeIdMap(renderer: Renderer, geometry: BufferGeometry, maps: MeshMaps): void {
+    this.#pass.render(renderer, geometry, this.#buildIdMaterial(), maps.idMap, true)
   }
 
   #captureIslandMask(renderer: Renderer, maps: MeshMaps): void {
@@ -117,6 +139,8 @@ export class GeometryBaker {
     this.#material = null
     this.#maskMaterial?.dispose()
     this.#maskMaterial = null
+    this.#idMaterial?.dispose()
+    this.#idMaterial = null
     this.#pass.dispose()
   }
 }

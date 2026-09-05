@@ -78,6 +78,7 @@ export const GENERATOR_TYPES = [
   'lightDirt',
   'grunge',
   'fill',
+  'idSelect',
 ] as const
 export type GeneratorType = (typeof GENERATOR_TYPES)[number]
 
@@ -198,6 +199,15 @@ export interface TextureSetState {
   meshId: string
 }
 
+/** A paintable region of the source mesh: a material slot, object, colour ID or face. */
+export interface MeshPart {
+  index: number
+  name: string
+  kind: 'material' | 'object' | 'color' | 'face'
+  color: [number, number, number]
+  triangleCount: number
+}
+
 export interface MeshState {
   id: string
   name: string
@@ -205,6 +215,8 @@ export interface MeshState {
   source: { kind: 'primitive'; preset: string; params?: Record<string, number> } | { kind: 'imported'; fileName: string }
   triangleCount: number
   hasUVs: boolean
+  /** Source-mesh partitions a catalogue material can be dropped onto. */
+  parts: MeshPart[]
 }
 
 export interface ProjectState {

@@ -16,6 +16,7 @@ import {
   TorusKnotGeometry,
   Vector3,
 } from 'three/webgpu'
+import { stampSinglePart, stampVertexRanges } from './parts'
 import { prepareGeometry } from './tangents'
 
 export interface PrimitiveDef {
@@ -36,13 +37,13 @@ function atlasBox(size = 1, segments = 24): BufferGeometry {
   const half = size / 2
 
   // Six faces packed into a 3x2 grid, each face getting its own UV island.
-  const faces: { normal: Vector3; u: Vector3; v: Vector3; col: number; row: number }[] = [
-    { normal: new Vector3(1, 0, 0), u: new Vector3(0, 0, -1), v: new Vector3(0, 1, 0), col: 0, row: 0 },
-    { normal: new Vector3(-1, 0, 0), u: new Vector3(0, 0, 1), v: new Vector3(0, 1, 0), col: 1, row: 0 },
-    { normal: new Vector3(0, 1, 0), u: new Vector3(1, 0, 0), v: new Vector3(0, 0, -1), col: 2, row: 0 },
-    { normal: new Vector3(0, -1, 0), u: new Vector3(1, 0, 0), v: new Vector3(0, 0, 1), col: 0, row: 1 },
-    { normal: new Vector3(0, 0, 1), u: new Vector3(1, 0, 0), v: new Vector3(0, 1, 0), col: 1, row: 1 },
-    { normal: new Vector3(0, 0, -1), u: new Vector3(-1, 0, 0), v: new Vector3(0, 1, 0), col: 2, row: 1 },
+  const faces: { name: string; normal: Vector3; u: Vector3; v: Vector3; col: number; row: number }[] = [
+    { name: 'Right', normal: new Vector3(1, 0, 0), u: new Vector3(0, 0, -1), v: new Vector3(0, 1, 0), col: 0, row: 0 },
+    { name: 'Left', normal: new Vector3(-1, 0, 0), u: new Vector3(0, 0, 1), v: new Vector3(0, 1, 0), col: 1, row: 0 },
+    { name: 'Top', normal: new Vector3(0, 1, 0), u: new Vector3(1, 0, 0), v: new Vector3(0, 0, -1), col: 2, row: 0 },
+    { name: 'Bottom', normal: new Vector3(0, -1, 0), u: new Vector3(1, 0, 0), v: new Vector3(0, 0, 1), col: 0, row: 1 },
+    { name: 'Front', normal: new Vector3(0, 0, 1), u: new Vector3(1, 0, 0), v: new Vector3(0, 1, 0), col: 1, row: 1 },
+    { name: 'Back', normal: new Vector3(0, 0, -1), u: new Vector3(-1, 0, 0), v: new Vector3(0, 1, 0), col: 2, row: 1 },
   ]
 
   const cellW = 1 / 3
@@ -83,6 +84,11 @@ function atlasBox(size = 1, segments = 24): BufferGeometry {
   geometry.setAttribute('normal', new BufferAttribute(new Float32Array(normals), 3))
   geometry.setAttribute('uv', new BufferAttribute(new Float32Array(uvs), 2))
   geometry.setIndex(indices)
+  const vertsPerFace = (segments + 1) * (segments + 1)
+  stampVertexRanges(
+    geometry,
+    faces.map((face) => ({ name: face.name, kind: 'face' as const, vertexCount: vertsPerFace })),
+  )
   return geometry
 }
 
@@ -150,6 +156,13 @@ function atlasCylinder(radius = 0.6, height = 1.6, radial = 64, heightSegments =
   geometry.setAttribute('normal', new BufferAttribute(new Float32Array(normals), 3))
   geometry.setAttribute('uv', new BufferAttribute(new Float32Array(uvs), 2))
   geometry.setIndex(indices)
+  const sideVerts = (heightSegments + 1) * (radial + 1)
+  const capVerts = 1 + (radial + 1)
+  stampVertexRanges(geometry, [
+    { name: 'Side', kind: 'face', vertexCount: sideVerts },
+    { name: 'Top', kind: 'face', vertexCount: capVerts },
+    { name: 'Bottom', kind: 'face', vertexCount: capVerts },
+  ])
   return geometry
 }
 
@@ -202,5 +215,7 @@ export function getPrimitive(id: string): PrimitiveDef | null {
 export function buildPrimitive(id: string): BufferGeometry {
   const def = getPrimitive(id)
   if (!def) throw new Error(`Unknown primitive "${id}"`)
-  return prepareGeometry(def.build())
+  const geometry = def.build()
+  if (!geometry.userData.meshParts) stampSinglePart(geometry, def.name)
+  return prepareGeometry(geometry)
 }

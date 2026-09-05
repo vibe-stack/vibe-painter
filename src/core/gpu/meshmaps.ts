@@ -17,6 +17,7 @@
  */
 
 import {
+  NearestFilter,
   RGBAFormat,
   RedFormat,
   RenderTarget,
@@ -37,6 +38,7 @@ export interface RayMapData {
 }
 
 export const RAY_MAP_NAME = 'rayMaps'
+export const ID_MAP_NAME = 'idMap'
 
 export function createRayTarget(resolution: number, name = RAY_MAP_NAME): RenderTarget {
   const rt = new RenderTarget(resolution, resolution, { ...CHANNEL_TARGET_OPTIONS, format: RGBAFormat })
@@ -56,6 +58,11 @@ export class MeshMaps {
    * surface?" - so the unflooded answer is kept separately.
    */
   readonly islandMask: RenderTarget
+  /**
+   * Per-texel source-mesh part index, nearest-sampled so IDs never blend.
+   * Rasterised with the geometry maps; not dilated (a blended ID is nonsense).
+   */
+  readonly idMap: RenderTarget
   resolution: number
 
   #ray: RenderTarget
@@ -76,6 +83,13 @@ export class MeshMaps {
     })
     this.islandMask = new RenderTarget(resolution, resolution, { ...CHANNEL_TARGET_OPTIONS, format: RedFormat })
     this.islandMask.texture.name = 'islandMask'
+    this.idMap = new RenderTarget(resolution, resolution, {
+      ...CHANNEL_TARGET_OPTIONS,
+      format: RGBAFormat,
+      minFilter: NearestFilter,
+      magFilter: NearestFilter,
+    })
+    this.idMap.texture.name = ID_MAP_NAME
     this.#ray = createRayTarget(resolution)
   }
 
@@ -153,6 +167,7 @@ export class MeshMaps {
     this.resolution = resolution
     this.geometry.setSize(resolution, resolution)
     this.islandMask.setSize(resolution, resolution)
+    this.idMap.setSize(resolution, resolution)
     this.ensureRayTarget(resolution)
     // The geometry maps no longer describe anything until they are re-rendered.
     this.#geometryBaked = false
@@ -210,6 +225,7 @@ export class MeshMaps {
       thickness: ray ? ray.z : float(0.5),
       coverage,
       island: texture(this.islandMask.texture, uvNode).x,
+      partId: texture(this.idMap.texture, uvNode).x,
       baked: ray !== null,
     }
   }
@@ -217,6 +233,7 @@ export class MeshMaps {
   dispose(): void {
     this.geometry.dispose()
     this.islandMask.dispose()
+    this.idMap.dispose()
     this.#ray.dispose()
     this.#rayBaked = false
   }
@@ -257,6 +274,7 @@ export function neutralMeshMaps(): MeshMapNodes {
     thickness: float(0.5),
     coverage: float(1),
     island: float(1),
+    partId: float(0),
     baked: false,
   }
 }

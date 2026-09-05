@@ -32,6 +32,7 @@ import type {
   LayerState,
   Levels,
   MaskState,
+  MeshPart,
   ParamValue,
   ProjectState,
   ProjectionSettings,
@@ -52,6 +53,7 @@ import {
   moveLayer,
   removeLayer,
 } from './doc/document'
+import { readMeshParts } from './mesh/parts'
 import { uid } from './ids'
 import {
   collectPaintBufferIds,
@@ -179,7 +181,7 @@ export class VibePainter {
       meshImport: {
         formats: ['.glb', '.gltf'],
         method: 'importGltf',
-        notes: 'Replaces the current mesh. Scene graphs are flattened, centred and scaled to match the built-in primitives. Materials, animations and cameras are ignored.',
+        notes: 'Replaces the current mesh. Scene graphs are flattened, centred and scaled to match the built-in primitives. Source materials, objects and vertex-colour IDs are kept as mesh parts so a catalogue material can be dropped onto one region. Animations and cameras are ignored.',
       },
       environmentPresets: Object.keys(ENVIRONMENT_PRESETS),
       exportPresets: EXPORT_PRESETS.map((p) => ({
@@ -226,7 +228,8 @@ export class VibePainter {
     this.engine.setGeometry(geometry)
     const index = geometry.getIndex()
     const triangles = Math.floor((index ? index.count : geometry.getAttribute('position').count) / 3)
-    const mesh = createMesh(source, name, triangles, true)
+    const parts = readMeshParts(geometry)
+    const mesh = createMesh(source, name, triangles, true, parts)
 
     const project = this.engine.project
     project.meshes = [mesh]
@@ -290,12 +293,31 @@ export class VibePainter {
     return findLayer(set.layers, id)?.layer ?? null
   }
 
-  addFillLayer(options: { materialId?: string; name?: string; parentId?: string | null; index?: number; params?: Record<string, ParamValue> } = {}): string {
+  addFillLayer(
+    options: {
+      materialId?: string
+      name?: string
+      parentId?: string | null
+      index?: number
+      params?: Record<string, ParamValue>
+      /** When set, the new fill is masked to this source-mesh part. */
+      partId?: number
+    } = {},
+  ): string {
     const set = this.#requireSet()
     const defId = options.materialId ?? DEFAULT_MATERIAL_ID
     if (!getMaterialDef(defId)) throw new Error(`Unknown material "${defId}"`)
     const def = getMaterialDef(defId)!
-    const layer = createFillLayer(instantiateMaterial(defId, options.params ?? {}), options.name ?? def.name)
+    const parts = this.listMeshParts()
+    const part = options.partId !== undefined ? parts.find((entry) => entry.index === options.partId) : null
+    const name = options.name ?? (part ? `${def.name} · ${part.name}` : def.name)
+    const layer = createFillLayer(instantiateMaterial(defId, options.params ?? {}), name)
+    if (part && parts.length >= 2) {
+      layer.mask = createMask(0)
+      const generator = createGenerator('idSelect', { partId: part.index })
+      generator.name = part.name
+      layer.mask.generators.push(generator)
+    }
     insertLayer(set, layer, options.parentId ?? null, options.index)
     this.engine.project.activeLayerId = layer.id
     this.engine.sync('addFillLayer')
@@ -568,6 +590,40 @@ export class VibePainter {
     return this.engine.raycast(origin, direction)
   }
 
+  // -- mesh parts / ID drop ----------------------------------------------
+
+  listMeshParts(): MeshPart[] {
+    const documented = this.engine.project.meshes[0]?.parts
+    if (documented && documented.length > 0) return documented
+    return this.engine.listMeshParts()
+  }
+
+  /**
+   * Catalogue drag started: the viewport switches to the coloured ID overlay
+   * so the user can see the regions a drop will hit.
+   */
+  beginMaterialDrag(defId: string): void {
+    if (!getMaterialDef(defId)) throw new Error(`Unknown material "${defId}"`)
+    this.engine.setIdOverlay(true, defId)
+  }
+
+  setMaterialDragHover(partId: number | null): void {
+    this.engine.setIdHover(partId)
+  }
+
+  endMaterialDrag(): void {
+    this.engine.setIdOverlay(false)
+  }
+
+  /**
+   * Applies a catalogue material. `partId` masks the new fill to that
+   * source-mesh region; `null` covers the whole mesh.
+   */
+  dropMaterial(defId: string, partId: number | null = null): string {
+    if (!getMaterialDef(defId)) throw new Error(`Unknown material "${defId}"`)
+    return this.addFillLayer({ materialId: defId, partId: partId ?? undefined })
+  }
+
   // -- baking -------------------------------------------------------------
 
   async bake(settings: Partial<BakeSettings> = {}, onProgress?: (progress: BakeProgress) => void): Promise<void> {
@@ -670,6 +726,7 @@ export class VibePainter {
       meshName: this.engine.project.meshes[0]?.name ?? null,
       meshSource: this.engine.project.meshes[0]?.source ?? null,
       meshTriangles: this.engine.project.meshes[0]?.triangleCount ?? 0,
+      meshParts: this.listMeshParts().length,
       layers: this.engine.layerCount(),
       activeLayerId: this.engine.project.activeLayerId,
       geometryBaked: this.engine.meshMaps.geometryBaked,
@@ -707,6 +764,7 @@ export type {
   GeneratorType,
   ImportedGltf,
   LayerState,
+  MeshPart,
   PaintTargetKind,
   ProjectFile,
   SmartMaterialFile,

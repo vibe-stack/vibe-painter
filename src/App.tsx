@@ -31,6 +31,8 @@ import { LightingSection, MeshSection } from './ui/panels/ScenePanel'
 import { MaskSection } from './ui/panels/MaskEditor'
 import { ScrollArea, Section } from './ui/widgets/controls'
 import { getSession } from './ui/session'
+import { isFileDrag, isMaterialDrag } from './ui/drag'
+import { getMaterialDef } from './core/procedural/material'
 
 const VIEW_MODE_LABELS: Record<ViewMode, string> = {
   shaded: 'Shaded',
@@ -48,6 +50,7 @@ const VIEW_MODE_LABELS: Record<ViewMode, string> = {
   'mesh-position': 'Mesh · Position',
   'mesh-normal': 'Mesh · World Normal',
   'uv-coverage': 'Mesh · UV Coverage',
+  'mesh-id': 'Mesh · IDs',
 }
 
 const TOOLS: { id: Tool; label: string; icon: string; key: string }[] = [
@@ -104,8 +107,20 @@ function Workspace() {
     return () => window.removeEventListener('keydown', onKey)
   }, [api])
 
+  useEffect(() => {
+    const onDragEnd = () => api.endMaterialDrag()
+    window.addEventListener('dragend', onDragEnd)
+    return () => window.removeEventListener('dragend', onDragEnd)
+  }, [api])
+
   const status = api.status()
   const layer = api.activeLayerId ? api.getLayer(api.activeLayerId) : null
+  const overlayActive = api.engine.idOverlayActive
+  const overlayMaterial = api.engine.materialDragId ? getMaterialDef(api.engine.materialDragId) : null
+  const meshParts = api.listMeshParts()
+  const hoverPart = overlayActive
+    ? meshParts.find((part) => part.index === api.engine.idHoverPartId) ?? null
+    : null
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-app-void text-app-text">
@@ -184,16 +199,20 @@ function Workspace() {
         <section
           className="relative min-w-0 flex-1 bg-app-void"
           onDragEnter={(event) => {
+            if (!isFileDrag(event)) return
             event.preventDefault()
             dropDepth.current += 1
             setDropActive(true)
           }}
-          onDragOver={(event) => event.preventDefault()}
+          onDragOver={(event) => {
+            if (isFileDrag(event) || isMaterialDrag(event)) event.preventDefault()
+          }}
           onDragLeave={() => {
             dropDepth.current = Math.max(0, dropDepth.current - 1)
             if (dropDepth.current === 0) setDropActive(false)
           }}
           onDrop={(event) => {
+            if (isMaterialDrag(event)) return
             event.preventDefault()
             dropDepth.current = 0
             setDropActive(false)
@@ -212,6 +231,46 @@ function Workspace() {
           {dropActive && (
             <div className="pointer-events-none absolute inset-3 z-10 flex items-center justify-center rounded-[6px] border-2 border-dashed border-app-accent bg-app-accent-dim/30">
               <p className="text-[13px] font-medium text-app-text">Drop GLB to replace the mesh</p>
+            </div>
+          )}
+          {overlayActive && !dropActive && (
+            <div className="pointer-events-none absolute inset-x-0 top-3 z-10 mx-auto w-fit max-w-[min(92%,420px)] rounded-[4px] border border-app-line-strong bg-app-bg/90 px-3 py-1.5 text-center shadow-lg">
+              <p className="text-[11px] text-app-text">
+                {hoverPart ? (
+                  <>
+                    Drop to apply
+                    {overlayMaterial ? ` ${overlayMaterial.name}` : ''} to{' '}
+                    <span className="font-medium">{hoverPart.name}</span>
+                  </>
+                ) : meshParts.length >= 2 ? (
+                  <>
+                    Drop on a coloured part
+                    {overlayMaterial ? ` to assign ${overlayMaterial.name}` : ''}
+                    {', or off the mesh to apply everywhere'}
+                  </>
+                ) : (
+                  <>Drop on the mesh to add {overlayMaterial ? overlayMaterial.name : 'this material'}</>
+                )}
+              </p>
+              {hoverPart && (
+                <p className="mt-0.5 flex items-center justify-center gap-1.5 text-[10px] text-app-muted">
+                  <span
+                    className="inline-block h-[8px] w-[8px] rounded-[2px] border border-black/40"
+                    style={{
+                      background: `rgb(${Math.round(hoverPart.color[0] * 255)} ${Math.round(hoverPart.color[1] * 255)} ${Math.round(hoverPart.color[2] * 255)})`,
+                    }}
+                  />
+                  {hoverPart.kind === 'material'
+                    ? 'Source material'
+                    : hoverPart.kind === 'color'
+                      ? 'Colour ID'
+                      : hoverPart.kind === 'face'
+                        ? 'Face'
+                        : 'Object'}
+                  {' · '}
+                  {hoverPart.triangleCount.toLocaleString()} triangles
+                </p>
+              )}
             </div>
           )}
           {notice && (

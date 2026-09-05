@@ -26,7 +26,9 @@ const ANGLE_LIMIT_COS = Math.cos((60 * Math.PI) / 180)
 const PACK_MARGIN = 0.02
 
 export function uniqueUnwrap(geometry: BufferGeometry): BufferGeometry {
+  const parts = geometry.userData.meshParts
   const geo = geometry.getIndex() ? geometry.toNonIndexed() : geometry
+  if (parts) geo.userData.meshParts = parts
   const position = geo.getAttribute('position')
   const vertexCount = position.count
   const faceCount = Math.floor(vertexCount / 3)

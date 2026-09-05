@@ -20,7 +20,9 @@ import { DRACO_GLTF_CONFIG, DRACOLoader } from 'three/addons/loaders/DRACOLoader
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js'
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js'
-import { compactGeometryAttributes } from './attributes'
+import { attributeToFloat32, compactGeometryAttributes } from './attributes'
+import type { MeshPart, MeshPiece } from './parts'
+import { assignPartIds, attachMeshParts } from './parts'
 import { prepareGeometry } from './tangents'
 import { uniqueUnwrap, uvsOverlap } from './unwrap'
 
@@ -31,6 +33,8 @@ export interface ImportedGltf {
   triangleCount: number
   /** True when we generated or replaced UVs so the baker has a unique atlas. */
   generatedUVs: boolean
+  /** Source-mesh partitions (materials, objects, colour IDs) a fill can target. */
+  parts: MeshPart[]
 }
 
 /** Longest-axis length matching the built-in primitives (cube is 1.6, plane is 2). */
@@ -92,11 +96,11 @@ export async function loadGltfGeometry(source: File | Blob | ArrayBuffer, fileNa
 
   scene.updateMatrixWorld(true)
 
-  const pieces: BufferGeometry[] = []
+  const pieces: MeshPiece[] = []
   let generatedUVs = false
   scene.traverse((object) => {
-    const extracted = extractMeshGeometries(object)
-    for (const piece of extracted.geometries) pieces.push(piece)
+    const extracted = extractMeshPieces(object)
+    for (const piece of extracted.pieces) pieces.push(piece)
     if (extracted.generatedUVs) generatedUVs = true
   })
 
@@ -109,8 +113,9 @@ export async function loadGltfGeometry(source: File | Blob | ArrayBuffer, fileNa
     throw new Error(`"${name}" has no triangle meshes to paint`)
   }
 
-  packUvLayouts(pieces)
-  let geometry = combine(pieces)
+  const assignment = assignPartIds(pieces)
+  packUvLayouts(pieces.map((piece) => piece.geometry))
+  let geometry = combine(pieces.map((piece) => piece.geometry))
   // A unique atlas is mandatory for the ray baker: overlapping charts let the
   // last triangle win, which is the "face AO stamped onto the skull" failure.
   // Keep an authored unwrap only when it already is unique.
@@ -122,6 +127,7 @@ export async function loadGltfGeometry(source: File | Blob | ArrayBuffer, fileNa
   }
   fitToOrigin(geometry)
   prepareGeometry(geometry)
+  attachMeshParts(geometry, assignment.parts)
 
   const index = geometry.getIndex()
   const triangleCount = Math.floor((index ? index.count : geometry.getAttribute('position').count) / 3)
@@ -133,48 +139,53 @@ export async function loadGltfGeometry(source: File | Blob | ArrayBuffer, fileNa
     fileName: name,
     triangleCount,
     generatedUVs,
+    parts: assignment.parts,
   }
 }
 
-function extractMeshGeometries(object: Object3D): { geometries: BufferGeometry[]; generatedUVs: boolean } {
+function extractMeshPieces(object: Object3D): { pieces: MeshPiece[]; generatedUVs: boolean } {
   const mesh = asMesh(object)
-  if (!mesh) return { geometries: [], generatedUVs: false }
+  if (!mesh) return { pieces: [], generatedUVs: false }
   const source = mesh.geometry
   if (!source?.getAttribute('position') || source.getAttribute('position').count === 0) {
-    return { geometries: [], generatedUVs: false }
+    return { pieces: [], generatedUVs: false }
   }
 
   const instanced = asInstancedMesh(mesh)
   if (instanced && instanced.count > 0) {
-    const geometries: BufferGeometry[] = []
+    const pieces: MeshPiece[] = []
     let generatedUVs = false
     const local = new Matrix4()
     const world = new Matrix4()
     for (let i = 0; i < instanced.count; i++) {
       instanced.getMatrixAt(i, local)
       world.multiplyMatrices(instanced.matrixWorld, local)
-      const prepared = preparePiece(mesh, world)
-      geometries.push(prepared.geometry)
-      if (prepared.generatedUVs) generatedUVs = true
+      const extracted = preparePieces(mesh, world)
+      for (const piece of extracted.pieces) pieces.push(piece)
+      if (extracted.generatedUVs) generatedUVs = true
     }
-    return { geometries, generatedUVs }
+    return { pieces, generatedUVs }
   }
 
-  const prepared = preparePiece(mesh, mesh.matrixWorld)
-  return { geometries: [prepared.geometry], generatedUVs: prepared.generatedUVs }
+  return preparePieces(mesh, mesh.matrixWorld)
 }
 
-function preparePiece(mesh: Mesh, world: Matrix4): { geometry: BufferGeometry; generatedUVs: boolean } {
+/**
+ * One mesh becomes one piece per source material. Groups on a multi-material
+ * mesh are sliced so each slot keeps its name; a single-material mesh is one
+ * piece. Vertex colours stay until `assignPartIds` decides whether they are
+ * the ID source.
+ */
+function preparePieces(mesh: Mesh, world: Matrix4): { pieces: MeshPiece[]; generatedUVs: boolean } {
   const geometry = mesh.geometry.clone()
   // Float-expand *before* skinning and matrix bake. Writing a denormalised
   // position back into a normalised integer attribute would quantise it again
   // and smear the mesh.
-  compactGeometryAttributes(geometry, ['position', 'normal', 'uv', 'uv1', 'uv2', 'skinWeight'])
+  compactGeometryAttributes(geometry, ['position', 'normal', 'uv', 'uv1', 'uv2', 'skinWeight', 'color'])
   const skinned = asSkinnedMesh(mesh)
   if (skinned) bakeSkin(skinned, geometry)
   geometry.applyMatrix4(world)
   geometry.morphAttributes = {}
-  geometry.clearGroups()
 
   if (!geometry.getAttribute('uv')) {
     const alt = geometry.getAttribute('uv1') ?? geometry.getAttribute('uv2')
@@ -182,7 +193,9 @@ function preparePiece(mesh: Mesh, world: Matrix4): { geometry: BufferGeometry; g
   }
 
   for (const name of Object.keys(geometry.attributes)) {
-    if (name !== 'position' && name !== 'normal' && name !== 'uv') geometry.deleteAttribute(name)
+    if (name !== 'position' && name !== 'normal' && name !== 'uv' && name !== 'color') {
+      geometry.deleteAttribute(name)
+    }
   }
 
   let generatedUVs = false
@@ -195,7 +208,50 @@ function preparePiece(mesh: Mesh, world: Matrix4): { geometry: BufferGeometry; g
     generatedUVs = true
   }
 
-  return { geometry, generatedUVs }
+  const expanded = geometry.getIndex() ? geometry.toNonIndexed() : geometry
+  if (expanded !== geometry) geometry.dispose()
+
+  const materials = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : []
+  const objectName = mesh.name || mesh.parent?.name || 'Mesh'
+  const vertexCount = expanded.getAttribute('position').count
+  const groups = expanded.groups.length > 0
+    ? expanded.groups
+    : [{ start: 0, count: vertexCount, materialIndex: 0 }]
+
+  const pieces: MeshPiece[] = []
+  for (const group of groups) {
+    const slice = sliceVertexRange(expanded, group.start, group.count)
+    if (!slice) continue
+    const materialIndex = group.materialIndex ?? 0
+    const material = materials[materialIndex] ?? materials[0]
+    const materialName = (material?.name && material.name.trim()) || `Material ${materialIndex + 1}`
+    pieces.push({
+      geometry: slice,
+      materialKey: material?.uuid ?? `mat-${materialIndex}`,
+      materialName,
+      objectName,
+    })
+  }
+  expanded.dispose()
+  return { pieces, generatedUVs }
+}
+
+function sliceVertexRange(geometry: BufferGeometry, start: number, count: number): BufferGeometry | null {
+  const position = geometry.getAttribute('position')
+  if (!position || count < 3) return null
+  const end = Math.min(position.count, Math.max(0, start) + count)
+  const from = Math.max(0, start)
+  const length = end - from
+  if (length < 3) return null
+
+  const out = new BufferGeometry()
+  for (const name of Object.keys(geometry.attributes)) {
+    const attr = geometry.getAttribute(name)
+    const packed = attributeToFloat32(attr as Parameters<typeof attributeToFloat32>[0], attr.itemSize)
+    const sliced = packed.subarray(from * attr.itemSize, end * attr.itemSize)
+    out.setAttribute(name, new BufferAttribute(new Float32Array(sliced), attr.itemSize))
+  }
+  return out
 }
 
 function bakeSkin(mesh: SkinnedMesh, geometry: BufferGeometry): void {

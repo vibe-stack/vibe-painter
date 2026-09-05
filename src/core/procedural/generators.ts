@@ -214,6 +214,34 @@ register({
   },
 })
 
+register({
+  type: 'idSelect',
+  name: 'Mesh ID',
+  description:
+    'Masks one part of the source mesh: a material slot, a separate object, a vertex-colour ID, or a face group. Dropping a catalogue material onto the viewport writes this generator for you.',
+  requiresBake: false,
+  params: [
+    {
+      key: 'partId',
+      label: 'Part',
+      type: 'int',
+      default: 0,
+      min: 0,
+      max: 255,
+      step: 1,
+      group: 'ID',
+      description: 'Index of the source-mesh part to keep. Everything else is masked out.',
+    },
+  ],
+  build(ctx) {
+    const id = ctx.meshMaps.partId
+    const target = ctx.params.float('partId')
+    // Integer IDs, nearest-sampled: a 0.5 window is an exact match.
+    const match = float(1).sub(abs(id.sub(target)).mul(2).clamp(0, 1))
+    return match.mul(ctx.meshMaps.coverage)
+  },
+})
+
 // ---------------------------------------------------------------------------
 
 /** 1 when the uniform `value` equals `target`, 0 otherwise - branch-free. */

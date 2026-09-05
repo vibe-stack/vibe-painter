@@ -13,14 +13,19 @@
  *    are inspecting never recompiles anything.
  */
 
-import { MeshPhysicalNodeMaterial, MeshBasicNodeMaterial, Vector2 } from 'three/webgpu'
+import { DoubleSide, MeshPhysicalNodeMaterial, MeshBasicNodeMaterial, Vector2 } from 'three/webgpu'
 import type { Texture } from 'three/webgpu'
 import {
+  abs,
+  attribute,
   bitangentView,
   float,
+  fract,
   mat3,
+  mix,
   normalize,
   normalView,
+  normalWorld,
   tangentView,
   texture,
   uniform,
@@ -29,6 +34,7 @@ import {
   vec3,
   vec4,
 } from 'three/tsl'
+import { PART_ID_ATTRIBUTE } from '../mesh/parts'
 import { CHANNEL_INFO } from '../channels'
 import type { MeshMaps } from './meshmaps'
 import type { F, V2, V3 } from './nodes'
@@ -52,18 +58,28 @@ export const VIEW_MODES = [
   'mesh-position',
   'mesh-normal',
   'uv-coverage',
+  'mesh-id',
 ] as const
 export type ViewMode = (typeof VIEW_MODES)[number]
 
 export class ViewportMaterials {
   readonly shaded = new MeshPhysicalNodeMaterial()
   readonly debug = new MeshBasicNodeMaterial()
+  /** Flat ID colours + a little lighting. Used while dragging a catalogue material, and as the mesh-id view. */
+  readonly idOverlay = new MeshBasicNodeMaterial()
 
   #heightScale = uniform(1)
   #normalScale = uniform(1)
   #texel = uniform(new Vector2(1 / 1024, 1 / 1024))
   #mode = uniform(1)
+  #hoverId = uniform(-1)
+  #dimOthers = uniform(0)
   #built = false
+  #idBuilt = false
+
+  constructor() {
+    this.#buildIdOverlay()
+  }
 
   get heightScale(): number {
     return this.#heightScale.value
@@ -80,6 +96,15 @@ export class ViewportMaterials {
   setMode(mode: ViewMode): void {
     const index = VIEW_MODES.indexOf(mode)
     this.#mode.value = Math.max(1, index)
+  }
+
+  /**
+   * `partId` of the region under the cursor, or `null` when nothing is hovered.
+   * When a part is hovered the others dim, matching Painter's ID drop target.
+   */
+  setIdHover(partId: number | null): void {
+    this.#hoverId.value = partId ?? -1
+    this.#dimOthers.value = partId === null ? 0 : 1
   }
 
   get built(): boolean {
@@ -170,12 +195,40 @@ export class ViewportMaterials {
     this.debug.fragmentNode = vec4(debugColour, 1)
     this.debug.needsUpdate = true
     this.#built = true
+    this.#buildIdOverlay()
+  }
+
+  #buildIdOverlay(): void {
+    if (this.#idBuilt) return
+    const id = attribute(PART_ID_ATTRIBUTE, 'float') as unknown as F
+    const hue = fract(id.mul(0.61803398875).add(0.07))
+    const base = hsvToRgb(hue, float(0.72), float(0.92))
+    const hovered = abs(id.sub(this.#hoverId)).lessThan(float(0.5)).select(float(1), float(0))
+    const shade = mix(float(1), mix(float(0.32), float(1.18), hovered), this.#dimOthers)
+    const lighting = normalize(normalWorld)
+      .dot(normalize(vec3(0.25, 0.85, 0.45)))
+      .mul(0.38)
+      .add(0.62)
+    this.idOverlay.fragmentNode = vec4(base.mul(shade).mul(lighting), 1)
+    this.idOverlay.side = DoubleSide
+    this.idOverlay.polygonOffset = true
+    this.idOverlay.polygonOffsetFactor = 1
+    this.idOverlay.polygonOffsetUnits = 1
+    this.idOverlay.needsUpdate = true
+    this.#idBuilt = true
   }
 
   dispose(): void {
     this.shaded.dispose()
     this.debug.dispose()
+    this.idOverlay.dispose()
   }
+}
+
+/** Compact HSV, identical to `partDisplayColor` in `mesh/parts.ts`. */
+function hsvToRgb(h: F, s: F, v: F): V3 {
+  const rgb = abs(fract(vec3(h, h.add(2 / 3), h.add(1 / 3))).mul(6).sub(3)).sub(1).clamp(0, 1)
+  return mix(vec3(1, 1, 1), rgb, s).mul(v) as V3
 }
 
 /**

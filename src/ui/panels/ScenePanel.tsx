@@ -10,6 +10,7 @@ import { useRef, useState } from 'react'
 import { useApi, useEngineVersion } from '../context'
 import { ENVIRONMENT_PRESETS } from '../../core/gpu/environment'
 import { GLTF_ACCEPT, isGltfFileName } from '../../core/mesh/gltf'
+import { isMaterialDrag, materialIdFromDrop } from '../drag'
 import { Button, Row, Select, Slider } from '../widgets/controls'
 import { Note, ParamGroupLabel } from '../widgets/sections'
 
@@ -117,6 +118,8 @@ export function MeshSection() {
       </Note>
       {importNote && <Note tone="warn">{importNote}</Note>}
 
+      <MeshPartsList />
+
       <ParamGroupLabel>Texture Resolution</ParamGroupLabel>
       <div className="grid grid-cols-4 gap-1 px-2">
         {RESOLUTIONS.map((size) => (
@@ -135,6 +138,79 @@ export function MeshSection() {
         ))}
       </div>
       <Note>Changing this reallocates every channel target and clears painted pixels.</Note>
+    </>
+  )
+}
+
+function MeshPartsList() {
+  const api = useApi()
+  useEngineVersion()
+  const parts = api.listMeshParts()
+  const hoverId = api.engine.idOverlayActive ? api.engine.idHoverPartId : null
+  const [dropTarget, setDropTarget] = useState<number | null>(null)
+
+  if (parts.length < 2) return null
+
+  const kindLabel =
+    parts[0].kind === 'material'
+      ? 'source materials'
+      : parts[0].kind === 'color'
+        ? 'colour IDs'
+        : parts[0].kind === 'face'
+          ? 'faces'
+          : 'objects'
+
+  return (
+    <>
+      <ParamGroupLabel>Mesh Parts</ParamGroupLabel>
+      <Note>Drag a catalogue material onto a row, or onto the coloured wireframe in the viewport.</Note>
+      <ul className="px-2 pb-1">
+        {parts.map((part) => {
+          const hot = dropTarget === part.index || hoverId === part.index
+          return (
+            <li key={part.index}>
+              <div
+                className={`flex items-center gap-1.5 rounded-[3px] px-1 py-[3px] text-[11px] transition-colors ${
+                  hot ? 'bg-app-accent-dim/45 text-app-text' : 'text-app-muted hover:bg-app-raised'
+                }`}
+                onDragOver={(event) => {
+                  if (!isMaterialDrag(event)) return
+                  event.preventDefault()
+                  event.stopPropagation()
+                  setDropTarget(part.index)
+                  api.setMaterialDragHover(part.index)
+                }}
+                onDragLeave={() => {
+                  setDropTarget((current) => (current === part.index ? null : current))
+                }}
+                onDrop={(event) => {
+                  const defId = materialIdFromDrop(event)
+                  setDropTarget(null)
+                  if (!defId) return
+                  event.preventDefault()
+                  event.stopPropagation()
+                  api.dropMaterial(defId, part.index)
+                  api.endMaterialDrag()
+                }}
+              >
+                <span
+                  className="h-[10px] w-[10px] shrink-0 rounded-[2px] border border-black/40"
+                  style={{
+                    background: `rgb(${Math.round(part.color[0] * 255)} ${Math.round(part.color[1] * 255)} ${Math.round(part.color[2] * 255)})`,
+                  }}
+                />
+                <span className="min-w-0 flex-1 truncate">{part.name}</span>
+                <span className="shrink-0 tabular-nums text-[9px] text-app-faint">
+                  {part.triangleCount.toLocaleString()}
+                </span>
+              </div>
+            </li>
+          )
+        })}
+      </ul>
+      <Note>
+        {parts.length} {kindLabel}
+      </Note>
     </>
   )
 }

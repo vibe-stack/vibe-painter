@@ -19,6 +19,7 @@ export * from './doc/serialize'
 export { PRIMITIVES, buildPrimitive, getPrimitive } from './mesh/primitives'
 export { loadGltfGeometry, isGltfFileName, GLTF_ACCEPT } from './mesh/gltf'
 export type { ImportedGltf } from './mesh/gltf'
+export { PART_ID_ATTRIBUTE, partDisplayColor, readMeshParts } from './mesh/parts'
 export { prepareGeometry, computeTangents } from './mesh/tangents'
 
 export { BUILT_IN_MATERIALS, DEFAULT_MATERIAL_ID } from './procedural/catalogue'

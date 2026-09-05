@@ -17,6 +17,8 @@ import type { ReactNode } from 'react'
 import { listCategories, listMaterialDefs } from '../../core/procedural/material'
 import type { ProceduralMaterialDef } from '../../core/procedural/material'
 import { PRIORITY_VISIBLE, swatchColours, thumbnails } from '../../core/preview/thumbnails'
+import { useApi } from '../context'
+import { setMaterialDragData } from '../drag'
 import { Row } from './controls'
 import { useDismiss } from './useDismiss'
 import { useThumbnails } from './useThumbnails'
@@ -168,7 +170,9 @@ function MaterialCard({
   compact: boolean
   onPick: () => void
 }) {
+  const api = useApi()
   const ref = useRef<HTMLButtonElement | null>(null)
+  const dragged = useRef(false)
   const url = thumbnails.url(def.id)
   const status = thumbnails.status(def.id)
 
@@ -206,8 +210,21 @@ function MaterialCard({
     <button
       ref={ref}
       type="button"
-      onClick={onPick}
-      title={`${def.name} — ${def.description}`}
+      draggable
+      onClick={() => {
+        if (dragged.current) {
+          dragged.current = false
+          return
+        }
+        onPick()
+      }}
+      onDragStart={(event) => {
+        dragged.current = true
+        setMaterialDragData(event.dataTransfer, def.id)
+        api.beginMaterialDrag(def.id)
+      }}
+      onDragEnd={() => api.endMaterialDrag()}
+      title={`${def.name} — ${def.description}. Drag onto the mesh to assign to a part.`}
       className={`group relative flex flex-col overflow-hidden rounded-[4px] border text-left transition-colors ${
         active
           ? 'border-app-accent bg-app-accent-dim/30'

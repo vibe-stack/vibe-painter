@@ -31,7 +31,9 @@ import { initialisePaintBuffer } from './gpu/clear'
 import { clearTarget } from './gpu/uvspace'
 import { ViewportMaterials } from './gpu/viewport'
 import type { ViewMode } from './gpu/viewport'
+import { IdWireframe } from './gpu/idoverlay'
 import { BrushCursor } from './gpu/cursor'
+import { partIdAtFace, readMeshParts } from './mesh/parts'
 import { ProceduralEnvironment, ENVIRONMENT_PRESETS } from './gpu/environment'
 import { LightRig } from './gpu/lighting'
 import type { EnvironmentSettings } from './gpu/environment'
@@ -65,6 +67,9 @@ export interface SurfaceHit {
   normal: [number, number, number]
   uv: [number, number] | null
   distance: number
+  faceIndex: number | null
+  /** Source-mesh part under this hit, or null when the mesh is unpartitioned. */
+  partId: number | null
 }
 
 export class Engine {
@@ -103,6 +108,10 @@ export class Engine {
   #baking = false
   #showBackground = true
   #backgroundPending = true
+  #idOverlayActive = false
+  #idHoverPartId: number | null = null
+  #materialDragId: string | null = null
+  #idWireframe = new IdWireframe()
   /**
    * WebGPU compiles pipelines asynchronously and *skips* the first draw of a
    * new shader. Env, geometry bake and the composite are one-shot, so a cold
@@ -125,6 +134,7 @@ export class Engine {
 
     this.mesh.frustumCulled = false
     this.root.add(this.mesh)
+    this.root.add(this.#idWireframe.object)
     this.root.add(this.#lights.group)
     this.root.add(this.#cursor.object)
     this.#cursor.setBrush(this.#brush.radius, this.#brush.hardness, this.#brush.erase)
@@ -202,6 +212,8 @@ export class Engine {
     this.mesh.quaternion.identity()
     this.mesh.scale.set(1, 1, 1)
     this.mesh.updateMatrixWorld(true)
+    this.#idWireframe.rebuild(geometry)
+    this.#idWireframe.object.matrix.copy(this.mesh.matrixWorld)
 
     if (this.#renderer) this.#bakeGeometry()
     this.#meshMaps.clearRayMaps()
@@ -341,8 +353,48 @@ export class Engine {
   }
 
   #applyViewMode(): void {
+    const showIds = this.#idOverlayActive || this.#viewMode === 'mesh-id'
+    this.#idWireframe.setVisible(showIds)
+    if (showIds) {
+      this.mesh.material = this.#viewport.idOverlay
+      return
+    }
     if (!this.#viewport.built) return
     this.mesh.material = this.#viewMode === 'shaded' ? this.#viewport.shaded : this.#viewport.debug
+  }
+
+  get idOverlayActive(): boolean {
+    return this.#idOverlayActive
+  }
+
+  get idHoverPartId(): number | null {
+    return this.#idHoverPartId
+  }
+
+  get materialDragId(): string | null {
+    return this.#materialDragId
+  }
+
+  setIdOverlay(active: boolean, materialId: string | null = null): void {
+    this.#idOverlayActive = active
+    this.#materialDragId = active ? materialId : null
+    if (!active) {
+      this.#idHoverPartId = null
+      this.#viewport.setIdHover(null)
+    }
+    this.#applyViewMode()
+    this.#notify('idOverlay')
+  }
+
+  setIdHover(partId: number | null): void {
+    if (this.#idHoverPartId === partId) return
+    this.#idHoverPartId = partId
+    this.#viewport.setIdHover(partId)
+    this.#notify('idHover')
+  }
+
+  listMeshParts() {
+    return readMeshParts(this.geometry)
   }
 
   get heightScale(): number {
@@ -731,11 +783,14 @@ export class Engine {
     } else {
       normal.set(0, 0, 1)
     }
+    const faceIndex = hit.faceIndex ?? null
     return {
       point: [hit.point.x, hit.point.y, hit.point.z],
       normal: [normal.x, normal.y, normal.z],
       uv: hit.uv ? [hit.uv.x, hit.uv.y] : null,
       distance: hit.distance,
+      faceIndex,
+      partId: partIdAtFace(geometry, faceIndex),
     }
   }
 
@@ -775,6 +830,7 @@ export class Engine {
     this.#environment.dispose()
     this.#lights.dispose()
     this.#cursor.dispose()
+    this.#idWireframe.dispose()
     this.#viewport.dispose()
     for (const buffer of this.#paintBuffers.values()) buffer.dispose()
     this.#paintBuffers.clear()

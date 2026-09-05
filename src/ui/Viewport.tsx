@@ -23,6 +23,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import type { VibePainter } from '../core/api'
 import type { SurfaceHit } from '../core/engine'
 import { useApi } from './context'
+import { isMaterialDrag, materialIdFromDrop } from './drag'
 
 export type Tool = 'orbit' | 'paint' | 'erase'
 
@@ -247,6 +248,46 @@ function Stage({ api, tool, onPaintBlocked }: ViewportProps & { api: VibePainter
       if (controls.current) controls.current.enabled = true
     }
   }, [api, gl, hitAt, tool, onPaintBlocked])
+
+  useEffect(() => {
+    const element = gl.domElement as HTMLCanvasElement
+
+    const onDragOver = (event: DragEvent) => {
+      if (!isMaterialDrag(event)) return
+      event.preventDefault()
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+      const hit = hitAt(event.clientX, event.clientY)
+      const parts = api.listMeshParts()
+      const partId = hit?.partId ?? null
+      api.setMaterialDragHover(parts.length >= 2 ? partId : null)
+    }
+
+    const onDragLeave = (event: DragEvent) => {
+      if (!isMaterialDrag(event)) return
+      api.setMaterialDragHover(null)
+    }
+
+    const onDrop = (event: DragEvent) => {
+      const defId = materialIdFromDrop(event)
+      if (!defId) return
+      event.preventDefault()
+      event.stopPropagation()
+      const hit = hitAt(event.clientX, event.clientY)
+      const parts = api.listMeshParts()
+      const partId = parts.length >= 2 ? (hit?.partId ?? null) : null
+      api.dropMaterial(defId, partId)
+      api.endMaterialDrag()
+    }
+
+    element.addEventListener('dragover', onDragOver)
+    element.addEventListener('dragleave', onDragLeave)
+    element.addEventListener('drop', onDrop)
+    return () => {
+      element.removeEventListener('dragover', onDragOver)
+      element.removeEventListener('dragleave', onDragLeave)
+      element.removeEventListener('drop', onDrop)
+    }
+  }, [api, gl, hitAt])
 
   return null
 }

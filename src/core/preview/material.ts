@@ -73,6 +73,7 @@ function previewMeshMaps(): MeshMapNodes {
     thickness: float(0.5),
     coverage: float(1),
     island: float(1),
+    partId: float(0),
     baked: false,
   }
 }

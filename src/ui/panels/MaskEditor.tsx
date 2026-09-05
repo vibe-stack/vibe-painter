@@ -38,6 +38,7 @@ export function MaskSection() {
           <Button onClick={() => api.enableMaskPainting(layerId)}>Paintable</Button>
           <Button onClick={() => api.addMask(layerId, { base: 0, generator: 'curvature' })}>Edge Wear</Button>
           <Button onClick={() => api.addMask(layerId, { base: 0, generator: 'dirt' })}>Dirt</Button>
+          <Button onClick={() => api.addMask(layerId, { base: 0, generator: 'idSelect' })}>Mesh ID</Button>
         </div>
       </>
     )
@@ -157,9 +158,10 @@ export function MaskSection() {
               levels={generator.levels}
               onChange={(levels) => api.setGenerator(layerId, generator.id, { levels })}
             />
+            {generator.type === 'idSelect' && <IdPartPicker layerId={layerId} generatorId={generator.id} value={Number(generator.params.partId ?? 0)} />}
             <ParamEditor
               scope={`gen:${generator.id}`}
-              params={def.params}
+              params={def.params.filter((param) => !(generator.type === 'idSelect' && param.key === 'partId'))}
               values={generator.params}
               onChange={(key, value) => api.setGenerator(layerId, generator.id, { params: { [key]: value } })}
             />
@@ -167,6 +169,30 @@ export function MaskSection() {
         )
       })}
     </>
+  )
+}
+
+function IdPartPicker({
+  layerId,
+  generatorId,
+  value,
+}: {
+  layerId: string
+  generatorId: string
+  value: number
+}) {
+  const api = useApi()
+  useEngineVersion()
+  const parts = api.listMeshParts()
+  if (parts.length === 0) return null
+  return (
+    <Select
+      label="Part"
+      hint="The source-mesh region this layer is restricted to."
+      value={String(value)}
+      options={parts.map((part) => ({ value: String(part.index), label: part.name }))}
+      onChange={(next) => api.setGenerator(layerId, generatorId, { params: { partId: Number(next) } })}
+    />
   )
 }
 

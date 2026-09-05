@@ -42,6 +42,11 @@ export interface MeshMapNodes {
   coverage: F
   /** 1 inside a UV island, 0 outside. Never dilated, so always the truth. */
   island: F
+  /**
+   * Source-mesh part index (material slot, object, colour ID, or face).
+   * Integer-valued; 0 when the mesh has no partitions.
+   */
+  partId: F
   /** True when real baked maps are bound rather than neutral fallbacks. */
   baked: boolean
 }

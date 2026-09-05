@@ -30,6 +30,9 @@ export function MaterialBrowser() {
 
   return (
     <div className="flex h-[380px] flex-col">
+      <p className="px-2 pb-1 pt-0.5 text-[10px] leading-snug text-app-faint">
+        Click to apply to the selected fill. Drag onto the mesh to assign to a source material or ID part.
+      </p>
       <MaterialGrid activeId={activeMaterialId} onPick={apply} />
     </div>
   )
