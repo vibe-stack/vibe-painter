@@ -71,8 +71,9 @@ export class MeshMaps {
    */
   readonly islandMask: RenderTarget
   /**
-   * Per-texel source-mesh part index, nearest-sampled so IDs never blend.
-   * Rasterised with the geometry maps; not dilated (a blended ID is nonsense).
+   * Per-texel source-mesh part index.
+   * Rasterised with the geometry maps, then nearest-neighbour dilated so
+   * bilinear filtering of the composite does not read an empty gutter ID.
    */
   readonly idMap: RenderTarget
   resolution: number
@@ -191,7 +192,7 @@ export class MeshMaps {
    * same maps can be read from a fullscreen compositor pass and from a
    * mesh-space paint pass alike.
    */
-  nodes(uvNode: V2): MeshMapNodes {
+  nodes(uvNode: V2, texelCoord?: V2): MeshMapNodes {
     if (!this.#geometryBaked) return neutralMeshMaps()
 
     const posSample = texture(this.geometry.textures[0], uvNode)
@@ -227,6 +228,9 @@ export class MeshMaps {
     const bitangent = cross(normal, orthoTangent).mul(handedness)
 
     const ray = this.#rayBaked ? texture(this.#ray.texture, uvNode) : null
+    const idSample = texelCoord
+      ? texture(this.idMap.texture).load(texelCoord)
+      : texture(this.idMap.texture, uvNode)
 
     // Position, recovered to roughly 2e-6 of the bounding box.
     //
@@ -261,7 +265,11 @@ export class MeshMaps {
       thickness: ray ? ray.z : float(0.5),
       coverage,
       island,
-      partId: texture(this.idMap.texture, uvNode).x,
+      // Integer texel fetch when the compositor has a coord, so IDs never
+      // blend into a value that matches no part. `round` is the fallback for
+      // mesh-space reads that only have a UV.
+      partId: idSample.x,
+      partValid: idSample.w,
       baked: ray !== null,
     }
   }
@@ -312,6 +320,7 @@ export function neutralMeshMaps(): MeshMapNodes {
     coverage: float(1),
     island: float(1),
     partId: float(0),
+    partValid: float(1),
     baked: false,
   }
 }

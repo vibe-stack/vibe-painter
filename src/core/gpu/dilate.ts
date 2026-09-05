@@ -12,13 +12,12 @@
  * wrote.
  */
 
-import { float, max, step, texture, uniform, vec2, vec4 } from 'three/tsl'
-import { MeshBasicNodeMaterial, NoBlending, RGBAFormat, RedFormat, RenderTarget, Vector2 } from 'three/webgpu'
+import { float, ivec2, max, mix, mrt, step, texture, uniform, uv, vec2, vec4 } from 'three/tsl'
+import { MeshBasicNodeMaterial, NearestFilter, NoBlending, RGBAFormat, RedFormat, RenderTarget, Vector2 } from 'three/webgpu'
 import type { Renderer, Texture } from 'three/webgpu'
 import { QuadMesh } from 'three/webgpu'
-import { mrt, uv } from 'three/tsl'
 import type { F, V2, V4 } from './nodes'
-import { GEOMETRY_MAP_NAMES, RAY_MAP_NAME, createRayTarget } from './meshmaps'
+import { GEOMETRY_MAP_NAMES, ID_MAP_NAME, RAY_MAP_NAME, createRayTarget } from './meshmaps'
 import type { MeshMaps } from './meshmaps'
 import { SLOT_COUNT, SLOT_NAMES } from '../channels'
 import type { PaintBuffer } from '../gpu/targets'
@@ -105,6 +104,39 @@ function dilateNode(
   return { outputs, coverage: vec4(grown, grown, grown, grown) }
 }
 
+/**
+ * One dilation step for an ID map: copy a neighbour's ID, never blend.
+ *
+ * Averaging IDs produces values that match no part, which is exactly the
+ * stair-stepped halo along every UV island. Alpha is the "this texel was
+ * rasterised" flag (part 0 is a real ID, so the index itself cannot be the
+ * coverage signal).
+ */
+function dilateIdNode(source: Texture, texelSize: V2): V4 {
+  // Texel fetches, not `texture()`. three's WebGPU path binds a filtering
+  // sampler for every texture() node regardless of magFilter, so a bilinear
+  // ID read invents values like 1.5 that match no part - and 16 iterations of
+  // that is a 16-texel white halo around every UV island.
+  const res = float(1).div(texelSize.x.max(1e-8))
+  // Same coord convention as the compositor (`ivec2(uv * resolution)`), so a
+  // dilated ID lands on the texel the mask will actually fetch.
+  const coord = ivec2(uv().mul(res))
+  const loadAt = (dx: number, dy: number) => texture(source).load(coord.add(ivec2(dx, dy)))
+  const own = loadAt(0, 0)
+  let best: V4 = own as unknown as V4
+  let bestAlpha: F = own.w
+  for (const [dx, dy] of NEIGHBOURS) {
+    const sample = loadAt(dx, dy)
+    const better = step(bestAlpha.add(1e-4), sample.w)
+    best = mix(best, sample, better) as V4
+    bestAlpha = mix(bestAlpha, sample.w, better) as F
+  }
+  const keep = step(float(0.5), own.w)
+  const filled = mix(best, own, keep) as V4
+  const written = step(float(0.5), filled.w)
+  return vec4(filled.x, filled.y, filled.z, written)
+}
+
 export class Dilator {
   #quad = new QuadMesh()
   #texelSize = uniform(new Vector2(1 / 1024, 1 / 1024))
@@ -116,6 +148,9 @@ export class Dilator {
   #coverageScratch: RenderTarget | null = null
   #rayMaterial: MeshBasicNodeMaterial | null = null
   #rayScratch: RenderTarget | null = null
+  #idMaterialFwd: MeshBasicNodeMaterial | null = null
+  #idMaterialBack: MeshBasicNodeMaterial | null = null
+  #idScratch: RenderTarget | null = null
   #sourceKey = ''
   #blitter = new Blitter()
 
@@ -146,6 +181,47 @@ export class Dilator {
       // convention with every other pass by construction.
       this.#blitter.blit(renderer, scratch.textures, maps.geometry, GEOMETRY_MAP_NAMES)
     }
+  }
+
+  /**
+   * Floods each source-mesh part ID into the UV gutter by copying, not
+   * averaging. Without this the compositor mask is 0 on every island border
+   * (standard rasterisation misses pixel centres) and bilinear filtering of
+   * the composite shows it as a stepped halo.
+   */
+  dilateId(renderer: Renderer, maps: MeshMaps, iterations: number): void {
+    if (iterations <= 0) return
+    const res = maps.resolution
+    this.#texelSize.value.set(1 / res, 1 / res)
+    const scratch = this.#ensureIdScratch(res)
+    const fwd = this.#ensureIdMaterial(maps.idMap.texture, 'fwd')
+    const back = this.#ensureIdMaterial(scratch.texture, 'back')
+    // First write is drawn twice: WebGPU skips the first draw of a new
+    // pipeline, and a skipped write into scratch followed by a blit would
+    // wipe the rasterised ID map.
+    renderQuad(renderer, this.#quad, fwd, scratch)
+    renderQuad(renderer, this.#quad, fwd, scratch)
+    renderQuad(renderer, this.#quad, back, maps.idMap)
+    for (let i = 1; i < iterations; i++) {
+      renderQuad(renderer, this.#quad, fwd, scratch)
+      renderQuad(renderer, this.#quad, back, maps.idMap)
+    }
+  }
+
+  #ensureIdMaterial(source: Texture, tag: string): MeshBasicNodeMaterial {
+    const existing = tag === 'fwd' ? this.#idMaterialFwd : this.#idMaterialBack
+    const key = `${tag}:${source.id}`
+    if (existing && existing.userData.key === key) return existing
+    existing?.dispose()
+    const material = new MeshBasicNodeMaterial()
+    material.depthTest = false
+    material.depthWrite = false
+    material.blending = NoBlending
+    material.fragmentNode = dilateIdNode(source, this.#texelSize)
+    material.userData.key = key
+    if (tag === 'fwd') this.#idMaterialFwd = material
+    else this.#idMaterialBack = material
+    return material
   }
 
   /**
@@ -241,6 +317,20 @@ export class Dilator {
     return this.#slotScratch
   }
 
+  #ensureIdScratch(res: number): RenderTarget {
+    if (this.#idScratch && this.#idScratch.width === res) return this.#idScratch
+    this.#idScratch?.dispose()
+    const rt = new RenderTarget(res, res, {
+      ...CHANNEL_TARGET_OPTIONS,
+      format: RGBAFormat,
+      minFilter: NearestFilter,
+      magFilter: NearestFilter,
+    })
+    rt.texture.name = ID_MAP_NAME
+    this.#idScratch = rt
+    return rt
+  }
+
   #ensureCoverageScratch(res: number): RenderTarget {
     if (this.#coverageScratch && this.#coverageScratch.width === res) return this.#coverageScratch
     this.#coverageScratch?.dispose()
@@ -290,6 +380,9 @@ export class Dilator {
     this.#coverageScratch?.dispose()
     this.#rayMaterial?.dispose()
     this.#rayScratch?.dispose()
+    this.#idMaterialFwd?.dispose()
+    this.#idMaterialBack?.dispose()
+    this.#idScratch?.dispose()
     this.#blitter.dispose()
   }
 }

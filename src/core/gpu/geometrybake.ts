@@ -8,7 +8,7 @@
  * know which texels are real.
  */
 
-import { MeshBasicNodeMaterial, NoBlending, NodeMaterial, QuadMesh, Vector3 } from 'three/webgpu'
+import { BufferAttribute, MeshBasicNodeMaterial, NoBlending, NodeMaterial, QuadMesh, Vector3 } from 'three/webgpu'
 import type { BufferGeometry, Renderer } from 'three/webgpu'
 import {
   attribute,
@@ -123,13 +123,24 @@ export class GeometryBaker {
     material.depthWrite = false
     material.blending = NoBlending
     const id = attribute(PART_ID_ATTRIBUTE, 'float') as unknown as F
+    // Alpha is "this texel was covered", not the ID: part 0 is a real part,
+    // so a cleared (0,0,0,0) texel and a part-0 texel are distinguished only
+    // by alpha. Dilation copies IDs into the empty gutter from this flag.
     material.fragmentNode = vec4(id, 0, 0, 1)
     this.#idMaterial = material
     return material
   }
 
   #bakeIdMap(renderer: Renderer, geometry: BufferGeometry, maps: MeshMaps): void {
-    this.#pass.render(renderer, geometry, this.#buildIdMaterial(), maps.idMap, true)
+    // Expand each triangle in UV by a couple of texels so pixel centres on
+    // island borders are actually covered. Standard rasterisation leaves those
+    // empty, and a part mask then shows the layer underneath as a stepped seam.
+    const expanded = expandTriangleUVs(geometry, maps.resolution, 2)
+    this.#pass.render(renderer, expanded, this.#buildIdMaterial(), maps.idMap, true)
+    // WebGPU skips the first draw of a new pipeline; a second draw without
+    // clearing recovers the map if the first one was dropped.
+    this.#pass.render(renderer, expanded, this.#buildIdMaterial(), maps.idMap, false)
+    if (expanded !== geometry) expanded.dispose()
   }
 
   #captureIslandMask(renderer: Renderer, maps: MeshMaps): void {
@@ -156,4 +167,40 @@ export class GeometryBaker {
     this.#idMaterial = null
     this.#pass.dispose()
   }
+}
+
+/**
+ * Pushes each triangle's vertices away from its UV centroid so the rasteriser
+ * covers the texel centres that sit on the island border. The painted mesh's
+ * own UVs are not touched; this clone exists only for the ID pass.
+ */
+function expandTriangleUVs(geometry: BufferGeometry, resolution: number, texels: number): BufferGeometry {
+  const source = geometry.getIndex() ? geometry.toNonIndexed() : geometry.clone()
+  const uv = source.getAttribute('uv')
+  if (!uv || uv.count < 3) return source
+  const pad = texels / Math.max(1, resolution)
+  const out = new Float32Array(uv.count * 2)
+  for (let i = 0; i + 2 < uv.count; i += 3) {
+    const u0 = uv.getX(i), v0 = uv.getY(i)
+    const u1 = uv.getX(i + 1), v1 = uv.getY(i + 1)
+    const u2 = uv.getX(i + 2), v2 = uv.getY(i + 2)
+    const cu = (u0 + u1 + u2) / 3
+    const cv = (v0 + v1 + v2) / 3
+    const pts: [number, number][] = [[u0, v0], [u1, v1], [u2, v2]]
+    for (let k = 0; k < 3; k++) {
+      const du = pts[k][0] - cu
+      const dv = pts[k][1] - cv
+      const len = Math.hypot(du, dv)
+      const o = (i + k) * 2
+      if (len < 1e-12) {
+        out[o] = pts[k][0]
+        out[o + 1] = pts[k][1]
+        continue
+      }
+      out[o] = pts[k][0] + (du / len) * pad
+      out[o + 1] = pts[k][1] + (dv / len) * pad
+    }
+  }
+  source.setAttribute('uv', new BufferAttribute(out, 2))
+  return source
 }

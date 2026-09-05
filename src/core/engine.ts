@@ -479,6 +479,10 @@ export class Engine {
     // Without dilation the gutter is empty, and bilinear filtering pulls it
     // into every island edge as a dark rim.
     measure('geometry dilation', () => this.#dilator.dilateGeometry(renderer, this.#meshMaps, 16))
+    // Nearest-neighbour flood of part IDs into the gutter. Averaging would
+    // invent IDs that match nothing; skipping it leaves a 1-texel hole on
+    // every UV island border that bilinear filtering turns into a stepped seam.
+    measure('id dilation', () => this.#dilator.dilateId(renderer, this.#meshMaps, 16))
     if (options.rebuildGraph === false) this.#compositor.invalidate()
     else this.#compositor.invalidateGraph()
     // The brush graphs read these maps, so they have to be rebuilt too.

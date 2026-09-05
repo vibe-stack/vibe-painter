@@ -56,6 +56,8 @@ export interface MeshMapNodes {
    * Integer-valued; 0 when the mesh has no partitions.
    */
   partId: F
+  /** 1 where an ID was rasterised or dilated, 0 in empty atlas. Distinguishes part 0 from unwritten texels. */
+  partValid: F
   /** True when real baked maps are bound rather than neutral fallbacks. */
   baked: boolean
 }

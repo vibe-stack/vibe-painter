@@ -75,6 +75,7 @@ function previewMeshMaps(): MeshMapNodes {
     coverage: float(1),
     island: float(1),
     partId: float(0),
+    partValid: float(1),
     baked: false,
   }
 }

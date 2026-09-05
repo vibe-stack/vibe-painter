@@ -308,12 +308,13 @@ export class Compositor {
     material.blending = NoBlending
 
     const uvNode = uv()
+    const coord = ivec2(uvNode.mul(set.resolution)) as unknown as V2
     const ctx: BuildContext = {
       uv: uvNode,
-      coord: ivec2(uvNode.mul(set.resolution)) as unknown as V2,
+      coord,
       texel: float(1 / Math.max(1, set.resolution)),
       maps,
-      mapNodes: maps.nodes(uvNode),
+      mapNodes: maps.nodes(uvNode, coord),
       buffers,
       anchors: new Map(),
     }

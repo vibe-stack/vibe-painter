@@ -255,9 +255,11 @@ register({
   build(ctx) {
     const id = ctx.meshMaps.partId
     const target = ctx.params.float('partId')
-    // Integer IDs, nearest-sampled: a 0.5 window is an exact match.
-    const match = float(1).sub(abs(id.sub(target)).mul(2).clamp(0, 1))
-    return match.mul(ctx.meshMaps.coverage)
+    // Integer compare on a nearest-fetched ID. Do not multiply by the
+    // geometry coverage channel: that is bilinear-filtered and ramps to 0
+    // at every UV island border, which is exactly the stepped halo.
+    const match = float(1).sub(abs(id.sub(target)).clamp(0, 1))
+    return match.mul(ctx.meshMaps.partValid)
   },
 })
 
