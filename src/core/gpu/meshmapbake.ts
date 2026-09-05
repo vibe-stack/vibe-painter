@@ -137,15 +137,7 @@ export class GpuMeshMapBaker {
   #materialKey = ''
   #cancelled = false
 
-  #aoDistance = uniform(0.5)
-  #thicknessDistance = uniform(1)
-  #originBias = uniform(1e-4)
-  #curvatureIntensity = uniform(1)
-  #aoRayTotal = uniform(64)
-  #thicknessRayTotal = uniform(32)
-  #passIndex = uniform(0)
-  #raysPerPass = uniform(0, 'int')
-  #raysPerPassScale = uniform(0)
+  #uniforms = createBakeUniforms()
 
   cancel(): void {
     this.#cancelled = true
@@ -172,18 +164,6 @@ export class GpuMeshMapBaker {
     const passes = Math.ceil(aoRays / raysPerPass)
     const thicknessRays = Math.min(MAX_THICKNESS_RAYS, passes * raysPerPass)
 
-    this.#aoDistance.value = Math.max(1e-4, settings.aoDistance * radius)
-    this.#thicknessDistance.value = Math.max(1e-4, settings.thicknessDistance * radius * 2)
-    // Tracing the real surface needs only enough offset to clear float error on
-    // the originating triangle - orders of magnitude below the depth-map bias
-    // this replaces, which is why fine creases survive now.
-    this.#originBias.value = Math.max(settings.rayBias * radius, 1e-6)
-    this.#curvatureIntensity.value = settings.curvatureIntensity
-    this.#aoRayTotal.value = passes * raysPerPass
-    this.#thicknessRayTotal.value = thicknessRays
-    this.#raysPerPass.value = raysPerPass
-    this.#raysPerPassScale.value = raysPerPass
-
     onProgress?.({ fraction: 0.02, message: 'Measuring curvature' })
     ensureVertexCurvature(geometry, settings.curvatureRadius)
     if (this.#cancelled) return
@@ -193,7 +173,22 @@ export class GpuMeshMapBaker {
     if (this.#cancelled) return
 
     const accum = this.#ensureAccum(resolution)
+    // Before the values are written: a rebuild replaces the uniform *nodes*, so
+    // anything set on the old ones would go nowhere.
     this.#prepareMaterials(bvh, accum)
+
+    const u = this.#uniforms
+    u.aoDistance.value = Math.max(1e-4, settings.aoDistance * radius)
+    u.thicknessDistance.value = Math.max(1e-4, settings.thicknessDistance * radius * 2)
+    // Tracing the real surface needs only enough offset to clear float error on
+    // the originating triangle - orders of magnitude below the depth-map bias
+    // this replaces, which is why fine creases survive now.
+    u.originBias.value = Math.max(settings.rayBias * radius, 1e-6)
+    u.curvatureIntensity.value = settings.curvatureIntensity
+    u.aoRayTotal.value = passes * raysPerPass
+    u.thicknessRayTotal.value = thicknessRays
+    u.raysPerPass.value = raysPerPass
+    u.raysPerPassScale.value = raysPerPass
 
     try {
       onProgress?.({ fraction: 0.08, message: 'Preparing pipelines' })
@@ -209,7 +204,7 @@ export class GpuMeshMapBaker {
 
       for (let pass = 0; pass < passes; pass++) {
         if (this.#cancelled) return
-        this.#passIndex.value = pass
+        this.#uniforms.passIndex.value = pass
         this.#uvPass.render(renderer, geometry, this.#traceMaterial!, accum, false)
         onProgress?.({
           fraction: 0.12 + (0.8 * (pass + 1)) / passes,
@@ -225,7 +220,7 @@ export class GpuMeshMapBaker {
       this.#uvPass.render(renderer, geometry, this.#composeMaterial!, maps.ray, false)
       maps.markRayBaked()
     } finally {
-      this.#releaseScratch()
+      if (this.#cancelled) this.#releaseScratch()
     }
   }
 
@@ -240,6 +235,10 @@ export class GpuMeshMapBaker {
    * the ray count, so the ratio never approaches the ten bits of mantissa.
    */
   #buildTraceMaterial(bvh: BvhTextures): NodeMaterial {
+    const u = this.#uniforms
+    // A traversal of its own. Sharing one across materials is what silently
+    // killed every re-bake; `BvhTextures.createTracer` has the full story.
+    const trace = bvh.createTracer()
     const material = new NodeMaterial()
     material.vertexNode = uvClipPosition()
     material.depthTest = false
@@ -262,37 +261,37 @@ export class GpuMeshMapBaker {
 
       const frame = orthonormalFrame(N)
       const rotation = hash(uv() as V2)
-      const outwardOrigin = P.add(N.mul(this.#originBias))
-      const inwardOrigin = P.sub(N.mul(this.#originBias))
+      const outwardOrigin = P.add(N.mul(u.originBias))
+      const inwardOrigin = P.sub(N.mul(u.originBias))
 
-      Loop({ start: int(0), end: this.#raysPerPass, type: 'int', condition: '<' }, ({ i }) => {
-        const index = float(i).add(this.#passIndex.mul(this.#raysPerPassScale))
+      Loop({ start: int(0), end: u.raysPerPass, type: 'int', condition: '<' }, ({ i }) => {
+        const index = float(i).add(u.passIndex.mul(u.raysPerPassScale))
 
         // Cosine weighted and stratified. The elevation is a stratum of the ray
         // budget so no two rays crowd the same ring, and the azimuth advances
         // by the golden angle from a per-texel offset - so neighbouring texels
         // sample different azimuths and the residual noise has no structure to
         // line up along.
-        const u1 = index.add(0.5).div(this.#aoRayTotal)
+        const u1 = index.add(0.5).div(u.aoRayTotal)
         const u2 = fract(index.mul(float(0.6180339887)).add(rotation))
         const local = cosineHemisphere(u1 as F, u2 as F)
         const inPlane = frame.tangent.mul(local.x).add(frame.bitangent.mul(local.y))
 
         const aoDir = inPlane.add(N.mul(local.z)) as V3
-        const aoHit = bvh.trace(outwardOrigin, aoDir, this.#originBias as F, this.#aoDistance as F)
+        const aoHit = trace(outwardOrigin, aoDir, u.originBias as F, u.aoDistance as F)
         // Attenuate by distance: a wall a hair away occludes far more than one
         // at the edge of the search radius, and a binary test bands visibly
         // wherever a surface crosses the cutoff.
-        aoSum.addAssign(aoHit.x.mul(float(1).sub(aoHit.y.div(this.#aoDistance)).clamp(0, 1)))
+        aoSum.addAssign(aoHit.x.mul(float(1).sub(aoHit.y.div(u.aoDistance)).clamp(0, 1)))
 
-        If(index.lessThan(this.#thicknessRayTotal), () => {
+        If(index.lessThan(u.thicknessRayTotal), () => {
           // Thickness gets its own stratification rather than reusing the AO
           // ray's direction. It runs on a smaller budget, and the strata are
           // ordered - so taking the first N of the AO sequence would take the
           // first N *elevations*, every one of them hugging the normal. That
           // measures the depth straight down through the surface, not the mean
           // over the hemisphere, and a fin would read as solid as a sphere.
-          const t1 = index.add(0.5).div(this.#thicknessRayTotal)
+          const t1 = index.add(0.5).div(u.thicknessRayTotal)
           const t2 = fract(index.mul(float(0.6180339887)).add(rotation).add(float(0.5)))
           const inwardLocal = cosineHemisphere(t1 as F, t2 as F)
           // Mirrored through the surface: straight into the mesh, where the
@@ -302,9 +301,9 @@ export class GpuMeshMapBaker {
           const inward = frame.tangent.mul(inwardLocal.x)
             .add(frame.bitangent.mul(inwardLocal.y))
             .sub(N.mul(inwardLocal.z)) as V3
-          const hit = bvh.trace(inwardOrigin, inward, this.#originBias as F, this.#thicknessDistance as F)
-          const depth = hit.x.greaterThan(float(0)).select(hit.y, this.#thicknessDistance)
-          thickSum.addAssign(depth.div(this.#thicknessDistance).clamp(0, 1))
+          const hit = trace(inwardOrigin, inward, u.originBias as F, u.thicknessDistance as F)
+          const depth = hit.x.greaterThan(float(0)).select(hit.y, u.thicknessDistance)
+          thickSum.addAssign(depth.div(u.thicknessDistance).clamp(0, 1))
         })
       })
 
@@ -321,6 +320,7 @@ export class GpuMeshMapBaker {
    * dilation pass then floods outward from.
    */
   #buildComposeMaterial(source: RenderTarget): NodeMaterial {
+    const u = this.#uniforms
     const material = new NodeMaterial()
     material.vertexNode = uvClipPosition()
     material.depthTest = false
@@ -328,13 +328,13 @@ export class GpuMeshMapBaker {
     material.blending = NoBlending
 
     const accumulated = texture(source.texture, uv())
-    const ao = float(1).sub(accumulated.x.div(max(this.#aoRayTotal, float(1)))).clamp(0, 1)
+    const ao = float(1).sub(accumulated.x.div(max(u.aoRayTotal, float(1)))).clamp(0, 1)
     // Mean ray depth into the mesh, already normalised by the search distance:
     // 0 where rays exit immediately, 1 where nothing was found within reach.
-    const thickness = accumulated.y.div(max(this.#thicknessRayTotal, float(1))).clamp(0, 1)
+    const thickness = accumulated.y.div(max(u.thicknessRayTotal, float(1))).clamp(0, 1)
 
     const raw = attribute(CURVATURE_ATTRIBUTE, 'float') as unknown as F
-    const curvature = raw.mul(this.#curvatureIntensity).clamp(-1, 1).mul(0.5).add(0.5)
+    const curvature = raw.mul(u.curvatureIntensity).clamp(-1, 1).mul(0.5).add(0.5)
 
     material.fragmentNode = vec4(ao, curvature, thickness, 1)
     return material
@@ -383,6 +383,11 @@ export class GpuMeshMapBaker {
     const key = `${this.#bvhKey}:${accum.texture.id}`
     if (this.#materialKey === key && this.#traceMaterial) return
     this.#disposePassMaterials()
+    // Fresh nodes for a fresh pair of materials, for the same reason the
+    // traversal is rebuilt: a `uniform()` keeps the name the first material to
+    // generate it handed out, and the next material lays its groups out
+    // differently.
+    this.#uniforms = createBakeUniforms()
     this.#traceMaterial = this.#buildTraceMaterial(bvh)
     this.#composeMaterial = this.#buildComposeMaterial(accum)
     this.#materialKey = key
@@ -452,10 +457,16 @@ export class GpuMeshMapBaker {
   }
 
   /**
-   * Frees the accumulator between bakes. It follows the texture set's
-   * resolution, so at 2k it is ~33MB of idle VRAM for a pass the user runs by
-   * hand. The BVH stays: it is much smaller, and rebuilding it is the slow,
-   * CPU-bound part.
+   * Frees the accumulator and the pass materials.
+   *
+   * *Not* called between successful bakes, though the idle VRAM is real - ~33MB
+   * at 2k for a pass the user runs by hand. Releasing it made every bake build
+   * a new accumulator, and a new accumulator meant new pass materials, and
+   * rebuilding those is precisely the operation that emits a stale WGSL
+   * function against the wrong uniform layout. Keeping them means the second
+   * bake runs the pipeline the first one proved works. The rebuild path is safe
+   * now too - see `#prepareMaterials` - but not exercising it on every bake is
+   * worth more than the megabytes.
    */
   #releaseScratch(): void {
     this.#accum?.dispose()
@@ -479,6 +490,27 @@ export class GpuMeshMapBaker {
     this.#bvh = null
     this.#bvhKey = ''
     this.#uvPass.dispose()
+  }
+}
+
+/**
+ * Every uniform the two pass materials read.
+ *
+ * A factory rather than fields on the baker, so a material rebuild gets nodes
+ * that have never been generated into a shader before. See
+ * `BvhTextures.createTracer` for what reusing one costs.
+ */
+function createBakeUniforms() {
+  return {
+    aoDistance: uniform(0.5),
+    thicknessDistance: uniform(1),
+    originBias: uniform(1e-4),
+    curvatureIntensity: uniform(1),
+    aoRayTotal: uniform(64),
+    thicknessRayTotal: uniform(32),
+    passIndex: uniform(0),
+    raysPerPass: uniform(0, 'int'),
+    raysPerPassScale: uniform(0),
   }
 }
 

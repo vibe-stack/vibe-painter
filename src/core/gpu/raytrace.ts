@@ -30,7 +30,13 @@ import { ClampToEdgeWrapping, DataTexture, FloatType, NearestFilter, NoColorSpac
 import { Fn, Loop, If, Break, float, int, ivec2, max, min, textureLoad, uniform, vec3, vec4 } from 'three/tsl'
 import type { PackedBvh } from '../bake/bvh'
 import type { Node } from 'three/webgpu'
-import type { F, V3 } from './nodes'
+import type { F, V3, V4 } from './nodes'
+
+/**
+ * A BVH traversal bound to a single material. Handed out by
+ * `BvhTextures.createTracer`, which explains why it cannot be shared.
+ */
+export type BvhTracer = (origin: V3, dir: V3, tMin: F, tMax: F) => V4
 
 type I = Node<'int'>
 type IV2 = Node<'ivec2'>
@@ -48,132 +54,147 @@ export class BvhTextures {
   readonly nodeCount: number
   readonly triangleCount: number
 
-  #nodeCount = uniform(0, 'int')
-  /**
-   * Loop bound. Every step either descends one node or jumps forward past a
-   * subtree, so no walk can visit more nodes than the tree holds - but WGSL
-   * still wants a bound it can see.
-   */
-  #stepLimit = uniform(0, 'int')
-
   constructor(packed: PackedBvh) {
     this.nodes = createBuffer(packed.nodes, packed.nodeCount * 2)
     this.triangles = createBuffer(packed.triangles, packed.triangleCount * 3)
     this.nodeCount = packed.nodeCount
     this.triangleCount = packed.triangleCount
-    this.#nodeCount.value = packed.nodeCount
-    this.#stepLimit.value = packed.nodeCount + 1
   }
 
   /**
-   * Closest hit along `dir` in `[tMin, tMax]`.
+   * A fresh traversal function: closest hit along `dir` in `[tMin, tMax]`.
    *
    * Closest-hit rather than any-hit even for AO, which only needs a yes/no:
    * breaking out of a nested loop early is awkward in TSL, and the distance is
    * wanted anyway - AO attenuates by it and thickness *is* it. With `tMax`
    * bounding the search the two cost nearly the same.
+   *
+   * Built per call, and *never* shared between two materials. `setLayout`
+   * below turns this into a real WGSL function, and a real function is
+   * generated once and cached on the `Fn` - uniform references included, as
+   * the literal names the first material's uniform groups happened to give
+   * them. Building the same `Fn` into a second material emits that cached
+   * body verbatim against the second material's layout, where `nodeUniform1`
+   * is some unrelated matrix, and the shader fails to compile:
+   *
+   *     no matching overload for 'operator >= (i32, mat4x4<f32>)'
+   *
+   * three then marks the pipeline errored and skips the draw for good - no
+   * exception, no visible failure, just a pass that writes nothing. That is
+   * what made every mesh-map bake after the first one come back blank while
+   * the first one worked: the trace pass silently stopped running, the
+   * accumulator stayed at zero, and the compose pass dutifully turned zero
+   * into AO 1 everywhere.
    */
-  trace = Fn(([origin, dir, tMin, tMax]: [V3, V3, F, F]) => {
-    // Never divide by a zero component. WGSL leaves float division by zero
-    // *indeterminate* rather than defining it as infinity, and a NaN here is
-    // not a wrong pixel - it is a runaway. Every slab comparison against a NaN
-    // is false, so the node reads as a hit, the walk descends into the entire
-    // tree instead of pruning it, and the cost of a ray goes from tens of steps
-    // to tens of thousands. Nudging the component off zero keeps the slab test
-    // doing what it should: an axis the ray is parallel to yields a huge
-    // interval that rejects nothing.
-    const safeDir = dir.abs().max(float(1e-20)).mul(dir.sign().add(dir.sign().abs().oneMinus()))
-    const invDir = vec3(1, 1, 1).div(safeDir)
-    const closest = tMax.toVar('closest')
-    const found = float(0).toVar('found')
-    const node = int(0).toVar('node')
+  createTracer(): BvhTracer {
+    const nodeCount = uniform(this.nodeCount, 'int')
+    // Loop bound. Every step either descends one node or jumps forward past a
+    // subtree, so no walk can visit more nodes than the tree holds - but WGSL
+    // still wants a bound it can see.
+    const stepLimit = uniform(this.nodeCount + 1, 'int')
 
-    Loop({ start: int(0), end: this.#stepLimit, type: 'int', condition: '<' }, () => {
-      If(node.greaterThanEqual(this.#nodeCount), () => {
-        Break()
-      })
+    return Fn(([origin, dir, tMin, tMax]: [V3, V3, F, F]) => {
+      // Never divide by a zero component. WGSL leaves float division by zero
+      // *indeterminate* rather than defining it as infinity, and a NaN here is
+      // not a wrong pixel - it is a runaway. Every slab comparison against a NaN
+      // is false, so the node reads as a hit, the walk descends into the entire
+      // tree instead of pruning it, and the cost of a ray goes from tens of steps
+      // to tens of thousands. Nudging the component off zero keeps the slab test
+      // doing what it should: an axis the ray is parallel to yields a huge
+      // interval that rejects nothing.
+      const safeDir = dir.abs().max(float(1e-20)).mul(dir.sign().add(dir.sign().abs().oneMinus()))
+      const invDir = vec3(1, 1, 1).div(safeDir)
+      const closest = tMax.toVar('closest')
+      const found = float(0).toVar('found')
+      const node = int(0).toVar('node')
 
-      const lo = textureLoad(this.nodes, bufferCoord(node.mul(int(2)) as I))
-      const hi = textureLoad(this.nodes, bufferCoord(node.mul(int(2)).add(int(1)) as I))
+      Loop({ start: int(0), end: stepLimit, type: 'int', condition: '<' }, () => {
+        If(node.greaterThanEqual(nodeCount), () => {
+          Break()
+        })
 
-      const ta = lo.xyz.sub(origin).mul(invDir)
-      const tb = hi.xyz.sub(origin).mul(invDir)
-      const near = min(ta, tb)
-      const far = max(ta, tb)
-      const tNear = max(max(near.x, near.y), near.z)
-      const tFar = min(min(far.x, far.y), far.z)
+        const lo = textureLoad(this.nodes, bufferCoord(node.mul(int(2)) as I))
+        const hi = textureLoad(this.nodes, bufferCoord(node.mul(int(2)).add(int(1)) as I))
 
-      If(tFar.lessThan(max(tNear, tMin)).or(tNear.greaterThan(closest)), () => {
-        // `max` with the next index, not the escape index alone. A correct tree
-        // always escapes forward, so this changes nothing - but it makes the
-        // walk *unable* to revisit a node whatever the buffer holds, and that
-        // matters more than it looks: a cycle here would spin the loop up to
-        // its full bound on every ray, and a fragment shader that runs long
-        // enough gets killed a tile at a time, which shows up as rectangular
-        // blocks of garbage rather than as an error.
-        const forward = node.add(int(1)) as I
-        node.assign(int(lo.w).greaterThan(forward).select(int(lo.w), forward))
-      }).Else(() => {
-        // Payload is `start * 16 + count + 1` for a leaf and 0 for an internal
-        // node, so one comparison distinguishes them and one divide unpacks it.
-        If(hi.w.greaterThan(float(0)), () => {
-          const payload = hi.w.sub(1)
-          const start = payload.div(16).floor()
-          const count = int(payload.sub(start.mul(16)))
-          const base = int(start).mul(int(3))
+        const ta = lo.xyz.sub(origin).mul(invDir)
+        const tb = hi.xyz.sub(origin).mul(invDir)
+        const near = min(ta, tb)
+        const far = max(ta, tb)
+        const tNear = max(max(near.x, near.y), near.z)
+        const tFar = min(min(far.x, far.y), far.z)
 
-          Loop({ start: int(0), end: count, type: 'int', condition: '<' }, ({ i }) => {
-            const at = base.add(i.mul(int(3))) as I
-            const v0 = textureLoad(this.triangles, bufferCoord(at)).xyz
-            const e1 = textureLoad(this.triangles, bufferCoord(at.add(int(1)) as I)).xyz
-            const e2 = textureLoad(this.triangles, bufferCoord(at.add(int(2)) as I)).xyz
+        If(tFar.lessThan(max(tNear, tMin)).or(tNear.greaterThan(closest)), () => {
+          // `max` with the next index, not the escape index alone. A correct tree
+          // always escapes forward, so this changes nothing - but it makes the
+          // walk *unable* to revisit a node whatever the buffer holds, and that
+          // matters more than it looks: a cycle here would spin the loop up to
+          // its full bound on every ray, and a fragment shader that runs long
+          // enough gets killed a tile at a time, which shows up as rectangular
+          // blocks of garbage rather than as an error.
+          const forward = node.add(int(1)) as I
+          node.assign(int(lo.w).greaterThan(forward).select(int(lo.w), forward))
+        }).Else(() => {
+          // Payload is `start * 16 + count + 1` for a leaf and 0 for an internal
+          // node, so one comparison distinguishes them and one divide unpacks it.
+          If(hi.w.greaterThan(float(0)), () => {
+            const payload = hi.w.sub(1)
+            const start = payload.div(16).floor()
+            const count = int(payload.sub(start.mul(16)))
+            const base = int(start).mul(int(3))
 
-            // Moller-Trumbore. A degenerate triangle divides by zero here, but
-            // every use of the result is gated on `det` being non-zero, and an
-            // inf or NaN fails every one of those comparisons.
-            const pv = dir.cross(e2)
-            const det = e1.dot(pv)
-            const inv = float(1).div(det)
-            const tv = origin.sub(v0)
-            const u = tv.dot(pv).mul(inv)
-            const qv = tv.cross(e1)
-            const v = dir.dot(qv).mul(inv)
-            const t = e2.dot(qv).mul(inv)
+            Loop({ start: int(0), end: count, type: 'int', condition: '<' }, ({ i }) => {
+              const at = base.add(i.mul(int(3))) as I
+              const v0 = textureLoad(this.triangles, bufferCoord(at)).xyz
+              const e1 = textureLoad(this.triangles, bufferCoord(at.add(int(1)) as I)).xyz
+              const e2 = textureLoad(this.triangles, bufferCoord(at.add(int(2)) as I)).xyz
 
-            const inside = det.abs().greaterThan(float(1e-12))
-              .and(u.greaterThanEqual(float(0)))
-              .and(v.greaterThanEqual(float(0)))
-              .and(u.add(v).lessThanEqual(float(1)))
-            If(inside.and(t.greaterThanEqual(tMin)).and(t.lessThan(closest)), () => {
-              closest.assign(t)
-              found.assign(float(1))
+              // Moller-Trumbore. A degenerate triangle divides by zero here, but
+              // every use of the result is gated on `det` being non-zero, and an
+              // inf or NaN fails every one of those comparisons.
+              const pv = dir.cross(e2)
+              const det = e1.dot(pv)
+              const inv = float(1).div(det)
+              const tv = origin.sub(v0)
+              const u = tv.dot(pv).mul(inv)
+              const qv = tv.cross(e1)
+              const v = dir.dot(qv).mul(inv)
+              const t = e2.dot(qv).mul(inv)
+
+              const inside = det.abs().greaterThan(float(1e-12))
+                .and(u.greaterThanEqual(float(0)))
+                .and(v.greaterThanEqual(float(0)))
+                .and(u.add(v).lessThanEqual(float(1)))
+              If(inside.and(t.greaterThanEqual(tMin)).and(t.lessThan(closest)), () => {
+                closest.assign(t)
+                found.assign(float(1))
+              })
             })
           })
+          // Depth-first order puts the left child immediately after its parent,
+          // and a leaf's escape index is the very same place.
+          node.addAssign(int(1))
         })
-        // Depth-first order puts the left child immediately after its parent,
-        // and a leaf's escape index is the very same place.
-        node.addAssign(int(1))
       })
-    })
 
-    return vec4(found, closest, 0, 0)
-  }).setLayout({
-    // An explicit layout, so this compiles to a real WGSL function instead of
-    // being inlined at each call site. It is called twice per ray - once
-    // outward for occlusion, once inward for thickness - and inlining a body
-    // that declares its own loop counters and mutable state twice into one
-    // scope is a class of bug that cannot be reasoned about from the outside.
-    // A function call has none of that ambiguity, and the traversal is far too
-    // large to want duplicated anyway.
-    name: 'traceBvh',
-    type: 'vec4',
-    inputs: [
-      { name: 'origin', type: 'vec3' },
-      { name: 'dir', type: 'vec3' },
-      { name: 'tMin', type: 'float' },
-      { name: 'tMax', type: 'float' },
-    ],
-  })
+      return vec4(found, closest, 0, 0)
+    }).setLayout({
+      // An explicit layout, so this compiles to a real WGSL function instead of
+      // being inlined at each call site. It is called twice per ray - once
+      // outward for occlusion, once inward for thickness - and inlining a body
+      // that declares its own loop counters and mutable state twice into one
+      // scope is a class of bug that cannot be reasoned about from the outside.
+      // A function call has none of that ambiguity, and the traversal is far too
+      // large to want duplicated anyway.
+      name: 'traceBvh',
+      type: 'vec4',
+      inputs: [
+        { name: 'origin', type: 'vec3' },
+        { name: 'dir', type: 'vec3' },
+        { name: 'tMin', type: 'float' },
+        { name: 'tMax', type: 'float' },
+      ],
+    }) as unknown as BvhTracer
+  }
 
   dispose(): void {
     this.nodes.dispose()
