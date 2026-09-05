@@ -338,6 +338,9 @@ export class Engine {
     }
 
     const changed = this.#compositor.render(renderer, set, this.#meshMaps, this.#paintBuffers)
+    if (changed && !this.#painter.isStroking && this.#meshMaps.geometryBaked) {
+      this.#dilator.padCompositeGutter(renderer, this.#compositor.output, this.#meshMaps.islandMask.texture)
+    }
 
     if (this.#needsViewportRebuild) {
       measure('viewport material rebuild', () => {
@@ -489,7 +492,7 @@ export class Engine {
     // Nearest-neighbour flood of part IDs into the gutter. Averaging would
     // invent IDs that match nothing; skipping it leaves a 1-texel hole on
     // every UV island border that bilinear filtering turns into a stepped seam.
-    measure('id dilation', () => this.#dilator.dilateId(renderer, this.#meshMaps, 4))
+    measure('id dilation', () => this.#dilator.dilateId(renderer, this.#meshMaps, 16))
     if (options.rebuildGraph === false) this.#compositor.invalidate()
     else this.#compositor.invalidateGraph()
     // The brush graphs read these maps, so they have to be rebuilt too.
@@ -763,6 +766,9 @@ export class Engine {
     if (!renderer || !set) return
     this.#compositor.invalidate()
     this.#compositor.render(renderer, set, this.#meshMaps, this.#paintBuffers)
+    if (this.#meshMaps.geometryBaked) {
+      this.#dilator.padCompositeGutter(renderer, this.#compositor.output, this.#meshMaps.islandMask.texture)
+    }
   }
 
   get brushProjection(): ProjectionSettings {

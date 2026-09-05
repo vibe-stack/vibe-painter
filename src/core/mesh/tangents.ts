@@ -11,6 +11,7 @@
 import { BufferAttribute, Vector3 } from 'three/webgpu'
 import type { BufferGeometry } from 'three/webgpu'
 import { ensurePartIdAttribute } from './parts'
+import { isolatePartUvIslands } from './unwrap'
 
 export function computeTangents(geometry: BufferGeometry): void {
   const positionAttr = geometry.getAttribute('position')
@@ -103,8 +104,9 @@ export function prepareGeometry(geometry: BufferGeometry): BufferGeometry {
   if (!geometry.getAttribute('uv')) {
     throw new Error('Mesh has no UV coordinates. Painting and baking both work in UV space, so a UV layout is required.')
   }
-  if (!geometry.getAttribute('tangent')) computeTangents(geometry)
   ensurePartIdAttribute(geometry)
+  if (isolatePartUvIslands(geometry)) geometry.deleteAttribute('tangent')
+  if (!geometry.getAttribute('tangent')) computeTangents(geometry)
   geometry.computeBoundingBox()
   geometry.computeBoundingSphere()
   return geometry

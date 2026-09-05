@@ -12,6 +12,7 @@ import type { Channel } from '../channels'
 import { CHANNEL_INFO, CHANNEL_LIST, SLOT_COUNT, SLOT_NAMES } from '../channels'
 import type { ChannelBundle, F, V2, V3, V4 } from './nodes'
 import { defaultBundle } from './nodes'
+import { sampleTexturesForPart } from './sampling'
 
 const SWIZZLE_INDEX = { r: 0, g: 1, b: 2, a: 3 } as const
 
@@ -48,6 +49,32 @@ export function unpackSlots(textures: readonly Texture[], uvNode: V2, texelCoord
   // over same-sized targets is reading texel centres anyway, so there is
   // nothing for a sampler to interpolate.
   const samples = textures.map((tex) => (texelCoord ? texture(tex).load(texelCoord) : texture(tex, uvNode)))
+  const bundle = defaultBundle()
+
+  for (const info of CHANNEL_LIST) {
+    const sample = samples[info.slot]
+    if (!sample) continue
+    if (info.swizzle === 'rgb') {
+      ;(bundle as Record<Channel, unknown>)[info.id] = sample.xyz
+    } else {
+      ;(bundle as Record<Channel, unknown>)[info.id] = sample[info.swizzle]
+    }
+  }
+  return bundle
+}
+
+/**
+ * Same unpack, but bilinear taps that belong to a different source-mesh part
+ * (or to empty gutter) are discarded. See `sampleTexturesForPart`.
+ */
+export function unpackSlotsForPart(
+  textures: readonly Texture[],
+  uvNode: V2,
+  resolution: F,
+  partId: F,
+  idMap: Texture,
+): ChannelBundle {
+  const samples = sampleTexturesForPart([...textures], uvNode, resolution, partId, idMap)
   const bundle = defaultBundle()
 
   for (const info of CHANNEL_LIST) {

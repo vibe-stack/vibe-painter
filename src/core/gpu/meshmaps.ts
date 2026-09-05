@@ -273,7 +273,7 @@ export class MeshMaps {
       // Integer texel fetch when the compositor has a coord, so IDs never
       // blend into a value that matches no part. `round` is the fallback for
       // mesh-space reads that only have a UV.
-      partId: idSample.x,
+      partId: round(idSample.x),
       partValid: idSample.w,
       baked: ray !== null,
     }

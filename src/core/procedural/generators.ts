@@ -11,7 +11,7 @@
  * of those pushed through levels and broken up with noise.
  */
 
-import { abs, dot, float, max, mix, normalize, smoothstep, vec2, vec3 } from 'three/tsl'
+import { abs, dot, float, max, mix, normalize, round, smoothstep, vec2, vec3 } from 'three/tsl'
 import type { AnchorRef, AnchorSource, GeneratorType, ParamValue } from '../doc/types'
 import type { ChannelBundle, F, V2, V3 } from '../gpu/nodes'
 import { fbm01, ridged, scratches as scratchField, voronoi2, voronoiBorder, warp } from './noise'
@@ -255,10 +255,10 @@ register({
   build(ctx) {
     const id = ctx.meshMaps.partId
     const target = ctx.params.float('partId')
-    // Integer compare on a nearest-fetched ID. Do not multiply by the
-    // geometry coverage channel: that is bilinear-filtered and ramps to 0
-    // at every UV island border, which is exactly the stepped halo.
-    const match = float(1).sub(abs(id.sub(target)).clamp(0, 1))
+    // Hard integer compare. A soft `1 - clamp(|id-target|)` turns bilinear
+    // leftovers (1.4, 2.6) into a partial mask, which is a staircase along
+    // the part edge. `partValid` keeps part 0 distinct from unwritten gutter.
+    const match = abs(round(id).sub(round(target))).lessThan(float(0.5)).select(float(1), float(0))
     return match.mul(ctx.meshMaps.partValid)
   },
 })

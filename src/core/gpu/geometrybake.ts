@@ -8,7 +8,7 @@
  * know which texels are real.
  */
 
-import { BufferAttribute, MeshBasicNodeMaterial, NoBlending, NodeMaterial, QuadMesh, Vector3 } from 'three/webgpu'
+import { BufferAttribute, MeshBasicNodeMaterial, NoBlending, NodeMaterial, Vector3 } from 'three/webgpu'
 import type { BufferGeometry, Renderer } from 'three/webgpu'
 import {
   attribute,
@@ -21,19 +21,16 @@ import {
   positionWorld,
   tangentGeometry,
   tangentLocal,
-  texture,
   uniform,
-  uv,
   vec4,
 } from 'three/tsl'
 import { PART_ID_ATTRIBUTE } from '../mesh/parts'
 import { GEOMETRY_MAP_NAMES, MeshMaps, POSITION_SPLIT } from './meshmaps'
 import type { F } from './nodes'
-import { UVSpacePass, renderQuad, uvClipPosition } from './uvspace'
+import { UVSpacePass, uvClipPosition } from './uvspace'
 
 export class GeometryBaker {
   #pass = new UVSpacePass()
-  #quad = new QuadMesh()
   #material: NodeMaterial | null = null
   #maskMaterial: MeshBasicNodeMaterial | null = null
   #idMaterial: NodeMaterial | null = null
@@ -106,16 +103,16 @@ export class GeometryBaker {
       Math.max(1e-5, max.z - min.z),
     )
 
-    // Rasterise each triangle larger in UV than the mesh samples. Vertex UVs
-    // sit on island borders; bilinear then reads the texel *outside* the
-    // triangle — including along sharp 3D edges, which unique-unwrap cuts into
-    // separate charts. Expanding the bake (not the mesh, not a flood of the
-    // composite) covers that neighbourhood without smearing islands together.
-    const expanded = expandTriangleUVs(geometry, maps.resolution, 4)
+    // True island coverage from the mesh UVs the viewport actually samples.
+    // Must not use the expanded raster: that marks neighbour-chart overlap as
+    // "island", and composite padding then refuses to fill the gray holes.
+    this.#rasteriseIslandMask(renderer, geometry, maps)
+    // One texel of silhouette growth covers the bilinear neighbourhood
+    // without reaching the next packed chart (atlas gutter is several texels).
+    // Four texels stole interiors of neighbouring islands and wrote the
+    // default fill into the middle of a part.
+    const expanded = expandTriangleUVs(geometry, maps.resolution, 1)
     this.#pass.render(renderer, expanded, this.#buildMaterial(), maps.geometry, true)
-    // Snapshot which texels are real surface *before* dilation floods the
-    // coverage channel outward. Paint padding needs this unflooded answer.
-    this.#captureIslandMask(renderer, maps)
     this.#bakeIdMap(renderer, expanded, maps)
     if (expanded !== geometry) expanded.dispose()
     maps.markGeometryBaked(min, max)
@@ -143,19 +140,22 @@ export class GeometryBaker {
     this.#pass.render(renderer, geometry, this.#buildIdMaterial(), maps.idMap, false)
   }
 
-  #captureIslandMask(renderer: Renderer, maps: MeshMaps): void {
-    if (!this.#maskMaterial || this.#maskMaterial.userData.source !== maps.geometry.textures[0].id) {
-      this.#maskMaterial?.dispose()
-      const material = new MeshBasicNodeMaterial()
-      material.depthTest = false
-      material.depthWrite = false
-      material.blending = NoBlending
-      const coverage = texture(maps.geometry.textures[0], uv()).w
-      material.fragmentNode = vec4(coverage, coverage, coverage, coverage)
-      material.userData.source = maps.geometry.textures[0].id
-      this.#maskMaterial = material
-    }
-    renderQuad(renderer, this.#quad, this.#maskMaterial, maps.islandMask)
+  #buildCoverageMaterial(): MeshBasicNodeMaterial {
+    if (this.#maskMaterial) return this.#maskMaterial
+    const material = new MeshBasicNodeMaterial()
+    material.vertexNode = uvClipPosition()
+    material.depthTest = false
+    material.depthWrite = false
+    material.blending = NoBlending
+    material.fragmentNode = vec4(1, 1, 1, 1)
+    this.#maskMaterial = material
+    return material
+  }
+
+  #rasteriseIslandMask(renderer: Renderer, geometry: BufferGeometry, maps: MeshMaps): void {
+    const material = this.#buildCoverageMaterial()
+    this.#pass.render(renderer, geometry, material, maps.islandMask, true)
+    this.#pass.render(renderer, geometry, material, maps.islandMask, false)
   }
 
   dispose(): void {
@@ -170,22 +170,50 @@ export class GeometryBaker {
 }
 
 /**
- * Offsets each UV edge along its outward 2D normal so the rasteriser covers
- * the bilinear neighbourhood of every mesh vertex.
+ * Grows only the *silhouette* of each UV island (and any UV edge that still
+ * joins two source-mesh parts) so bilinear taps at seam vertices land on
+ * baked texels.
  *
- * Pushing vertices away from the centroid is not enough: unique-unwrap charts
- * are often skinny, and that move is almost parallel to the long edge, so the
- * edge that actually sits on an island border barely grows. An edge-normal
- * offset grows every side by a known texel amount. The painted mesh's UVs are
- * not touched — this clone exists only for the bake.
+ * Expanding every triangle (centroid or edge-normal) tears the island apart:
+ * a shared internal edge is pushed both ways, neighbouring triangles write
+ * extrapolated normals into each other's interiors, and world-normal / paint
+ * both go wrong in the middle of a part. Internal same-part edges stay put.
  */
 function expandTriangleUVs(geometry: BufferGeometry, resolution: number, texels: number): BufferGeometry {
   const source = geometry.getIndex() ? geometry.toNonIndexed() : geometry.clone()
   const uv = source.getAttribute('uv')
   if (!uv || uv.count < 3) return source
   const pad = texels / Math.max(1, resolution)
-  const maxMiter = pad * 8
-  const out = new Float32Array(uv.count * 2)
+  const maxMiter = pad * 6
+  const triCount = Math.floor(uv.count / 3)
+  const uses = new Map<string, number[]>()
+  const partAttr = source.getAttribute(PART_ID_ATTRIBUTE)
+  const partOf = (t: number) => (partAttr ? Math.round(partAttr.getX(t * 3)) : 0)
+
+  const keyOf = (ax: number, ay: number, bx: number, by: number): string => {
+    const a = `${ax.toFixed(5)},${ay.toFixed(5)}`
+    const b = `${bx.toFixed(5)},${by.toFixed(5)}`
+    return a < b ? `${a}|${b}` : `${b}|${a}`
+  }
+
+  for (let t = 0; t < triCount; t++) {
+    const i = t * 3
+    const u0 = uv.getX(i), v0 = uv.getY(i)
+    const u1 = uv.getX(i + 1), v1 = uv.getY(i + 1)
+    const u2 = uv.getX(i + 2), v2 = uv.getY(i + 2)
+    const id = partOf(t)
+    for (const key of [keyOf(u0, v0, u1, v1), keyOf(u1, v1, u2, v2), keyOf(u2, v2, u0, v0)]) {
+      const list = uses.get(key)
+      if (list) list.push(id)
+      else uses.set(key, [id])
+    }
+  }
+
+  const isBorder = (key: string): boolean => {
+    const ids = uses.get(key) ?? []
+    if (ids.length <= 1) return true
+    return ids.some((id) => id !== ids[0])
+  }
 
   const outward = (ax: number, ay: number, bx: number, by: number, sign: number): [number, number] => {
     const dx = bx - ax
@@ -195,33 +223,42 @@ function expandTriangleUVs(geometry: BufferGeometry, resolution: number, texels:
     return [(dy / len) * sign, (-dx / len) * sign]
   }
 
-  for (let i = 0; i + 2 < uv.count; i += 3) {
+  const out = new Float32Array(uv.count * 2)
+  for (let t = 0; t < triCount; t++) {
+    const i = t * 3
     const u0 = uv.getX(i), v0 = uv.getY(i)
     const u1 = uv.getX(i + 1), v1 = uv.getY(i + 1)
     const u2 = uv.getX(i + 2), v2 = uv.getY(i + 2)
     const area = (u1 - u0) * (v2 - v0) - (u2 - u0) * (v1 - v0)
     const sign = area >= 0 ? 1 : -1
-    const n01 = outward(u0, v0, u1, v1, sign)
-    const n12 = outward(u1, v1, u2, v2, sign)
-    const n20 = outward(u2, v2, u0, v0, sign)
-    const verts: [number, number, [number, number], [number, number]][] = [
-      [u0, v0, n20, n01],
-      [u1, v1, n01, n12],
-      [u2, v2, n12, n20],
+    const edges: { a: number; b: number; n: [number, number]; border: boolean }[] = [
+      { a: 0, b: 1, n: outward(u0, v0, u1, v1, sign), border: isBorder(keyOf(u0, v0, u1, v1)) },
+      { a: 1, b: 2, n: outward(u1, v1, u2, v2, sign), border: isBorder(keyOf(u1, v1, u2, v2)) },
+      { a: 2, b: 0, n: outward(u2, v2, u0, v0, sign), border: isBorder(keyOf(u2, v2, u0, v0)) },
     ]
+    const us = [u0, u1, u2]
+    const vs = [v0, v1, v2]
+    const ox = [0, 0, 0]
+    const oy = [0, 0, 0]
+    for (const edge of edges) {
+      if (!edge.border) continue
+      ox[edge.a] += edge.n[0] * pad
+      oy[edge.a] += edge.n[1] * pad
+      ox[edge.b] += edge.n[0] * pad
+      oy[edge.b] += edge.n[1] * pad
+    }
     for (let k = 0; k < 3; k++) {
-      const [u, v, a, b] = verts[k]
-      let ox = (a[0] + b[0]) * pad
-      let oy = (a[1] + b[1]) * pad
-      const miter = Math.hypot(ox, oy)
+      let x = ox[k]
+      let y = oy[k]
+      const miter = Math.hypot(x, y)
       if (miter > maxMiter && miter > 1e-12) {
         const s = maxMiter / miter
-        ox *= s
-        oy *= s
+        x *= s
+        y *= s
       }
       const o = (i + k) * 2
-      out[o] = u + ox
-      out[o + 1] = v + oy
+      out[o] = us[k] + x
+      out[o + 1] = vs[k] + y
     }
   }
   source.setAttribute('uv', new BufferAttribute(out, 2))

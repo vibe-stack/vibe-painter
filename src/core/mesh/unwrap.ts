@@ -375,3 +375,141 @@ function packCharts(charts: Chart[], uvs: Float32Array): void {
     }
   }
 }
+
+/**
+ * Makes every source-mesh part its own UV neighbourhood.
+ *
+ * Part IDs are per-triangle. If two parts still share a UV edge — a unique
+ * authored unwrap that crosses a material slot, a vertex-colour ID on one
+ * chart — the compositor's ID mask is a texel-grid line through that chart.
+ * Mapping it back onto the 3D join is the staircase along every ID seam.
+ *
+ * Duplicate that edge in UV and push each side toward its triangle so each
+ * part owns a strip the baker can pad without writing the neighbour.
+ *
+ * Returns true when UVs (or topology) changed, so tangents can be rebuilt.
+ */
+export function isolatePartUvIslands(geometry: BufferGeometry): boolean {
+  const partAttr = geometry.getAttribute(PART_ID_ATTRIBUTE)
+  const uvAttr = geometry.getAttribute('uv')
+  if (!partAttr || !uvAttr || uvAttr.count < 3) return false
+
+  let maxId = 0
+  for (let i = 0; i < partAttr.count; i++) maxId = Math.max(maxId, Math.round(partAttr.getX(i)))
+  if (maxId < 1) return false
+
+  const keyOf = (ax: number, ay: number, bx: number, by: number): string => {
+    const a = `${ax.toFixed(5)},${ay.toFixed(5)}`
+    const b = `${bx.toFixed(5)},${by.toFixed(5)}`
+    return a < b ? `${a}|${b}` : `${b}|${a}`
+  }
+
+  type EdgeUse = { tri: number; a: number; b: number; part: number }
+  const collect = (): { uv: Attr; part: Attr; uses: Map<string, EdgeUse[]> } => {
+    const uv = geometry.getAttribute('uv')!
+    const part = geometry.getAttribute(PART_ID_ATTRIBUTE)!
+    const index = geometry.getIndex()
+    const triCount = Math.floor((index ? index.count : uv.count) / 3)
+    const vert = (t: number, k: number) => (index ? index.getX(t * 3 + k) : t * 3 + k)
+    const uses = new Map<string, EdgeUse[]>()
+    for (let t = 0; t < triCount; t++) {
+      const ids = [vert(t, 0), vert(t, 1), vert(t, 2)]
+      const us = ids.map((i) => uv.getX(i))
+      const vs = ids.map((i) => uv.getY(i))
+      const p = Math.round(part.getX(ids[0]))
+      for (const [a, b] of [
+        [0, 1],
+        [1, 2],
+        [2, 0],
+      ] as const) {
+        const key = keyOf(us[a], vs[a], us[b], vs[b])
+        const entry = { tri: t, a: ids[a], b: ids[b], part: p }
+        const list = uses.get(key)
+        if (list) list.push(entry)
+        else uses.set(key, [entry])
+      }
+    }
+    return { uv, part, uses }
+  }
+
+  let { uv, uses } = collect()
+  const mixed: EdgeUse[][] = []
+  for (const group of uses.values()) {
+    if (group.length < 2) continue
+    if (group.every((entry) => entry.part === group[0].part)) continue
+    mixed.push(group)
+  }
+  if (mixed.length === 0) return false
+
+  const sharesVertexAcrossParts = mixed.some((group) => {
+    const owner = new Map<number, number>()
+    for (const entry of group) {
+      for (const v of [entry.a, entry.b]) {
+        const existing = owner.get(v)
+        if (existing !== undefined && existing !== entry.part) return true
+        owner.set(v, entry.part)
+      }
+    }
+    return false
+  })
+  if (sharesVertexAcrossParts) {
+    deindexInPlace(geometry)
+    ;({ uv, uses } = collect())
+  }
+
+  const du = new Float32Array(uv.count)
+  const dv = new Float32Array(uv.count)
+  const weight = new Float32Array(uv.count)
+  let changed = false
+
+  // Enough gutter that a 256² bilinear neighbourhood stays inside the part;
+  // at 2K this is ~12 texels, which dilation already expects to fill.
+  const gap = 0.006
+  const vertOf = (t: number, k: number) => {
+    const index = geometry.getIndex()
+    return index ? index.getX(t * 3 + k) : t * 3 + k
+  }
+
+  for (const group of uses.values()) {
+    if (group.length < 2) continue
+    if (group.every((entry) => entry.part === group[0].part)) continue
+    for (const entry of group) {
+      const v0 = vertOf(entry.tri, 0)
+      const v1 = vertOf(entry.tri, 1)
+      const v2 = vertOf(entry.tri, 2)
+      const cu = (uv.getX(v0) + uv.getX(v1) + uv.getX(v2)) / 3
+      const cv = (uv.getY(v0) + uv.getY(v1) + uv.getY(v2)) / 3
+      for (const vi of [entry.a, entry.b]) {
+        const dx = cu - uv.getX(vi)
+        const dy = cv - uv.getY(vi)
+        const len = Math.hypot(dx, dy)
+        if (len < 1e-12) continue
+        const move = Math.min(gap, len * 0.35)
+        du[vi] += (dx / len) * move
+        dv[vi] += (dy / len) * move
+        weight[vi] += 1
+        changed = true
+      }
+    }
+  }
+
+  if (!changed) return false
+
+  for (let i = 0; i < uv.count; i++) {
+    if (weight[i] === 0) continue
+    uv.setXY(i, uv.getX(i) + du[i] / weight[i], uv.getY(i) + dv[i] / weight[i])
+  }
+  ;(uv as BufferAttribute).needsUpdate = true
+  return true
+}
+
+function deindexInPlace(geometry: BufferGeometry): void {
+  const parts = geometry.userData.meshParts
+  const ni = geometry.toNonIndexed()
+  geometry.setIndex(null)
+  for (const name of Object.keys(geometry.attributes)) geometry.deleteAttribute(name)
+  for (const name of Object.keys(ni.attributes)) {
+    geometry.setAttribute(name, ni.getAttribute(name)!)
+  }
+  if (parts) geometry.userData.meshParts = parts
+}

@@ -38,7 +38,8 @@ import { PART_ID_ATTRIBUTE } from '../mesh/parts'
 import { CHANNEL_INFO } from '../channels'
 import type { MeshMaps } from './meshmaps'
 import type { F, V2, V3 } from './nodes'
-import { unpackSlots } from './packing'
+import { unpackSlots, unpackSlotsForPart } from './packing'
+import { sampleTextureForPart } from './sampling'
 import type { SlotTargets } from './targets'
 
 /** What the viewport is currently showing. */
@@ -117,16 +118,28 @@ export class ViewportMaterials {
     // targets in this same space (see `sampling.ts`), so no flip belongs here.
     const uvNode = uv()
     this.#texel.value.set(1 / slots.resolution, 1 / slots.resolution)
-    const bundle = unpackSlots(slots.rt.textures, uvNode)
+    const partId = attribute(PART_ID_ATTRIBUTE, 'float') as unknown as F
+    const resolution = float(slots.resolution)
+    // Part-aware bilinear: a 3D part edge is a geometric join, not a UV-texel
+    // join. Sampling the composite as a plain texture mixes neighbouring parts
+    // (and empty gutter) into a staircase along every ID seam.
+    const bundle = maps.geometryBaked
+      ? unpackSlotsForPart(slots.rt.textures, uvNode, resolution, partId, maps.idMap.texture)
+      : unpackSlots(slots.rt.textures, uvNode)
     const mapNodes = maps.nodes(uvNode)
 
     // --- Shaded ----------------------------------------------------------
     const heightTexture = slots.texture(CHANNEL_INFO.height.slot)
+    const heightSwizzle = CHANNEL_INFO.height.swizzle as 'r' | 'g' | 'b' | 'a'
+    const heightAt = maps.geometryBaked
+      ? (at: V2): F => sampleTextureForPart(heightTexture, at, resolution, partId, maps.idMap.texture)[heightSwizzle] as F
+      : null
     const heightNormal = normalFromHeightTexture(
       heightTexture,
       uvNode,
       this.#texel as unknown as { x: F; y: F },
       this.#heightScale as unknown as F,
+      heightAt,
     )
     const combined = combineNormals(bundle.normal as V3, heightNormal, this.#normalScale as unknown as F)
 
@@ -236,11 +249,19 @@ function hsvToRgb(h: F, s: F, v: F): V3 {
  * Sampling the texture rather than differentiating the analytic material keeps
  * this correct for painted height too.
  */
-function normalFromHeightTexture(tex: Texture, uvNode: V2, texel: { x: F; y: F }, scale: F): V3 {
+function normalFromHeightTexture(
+  tex: Texture,
+  uvNode: V2,
+  texel: { x: F; y: F },
+  scale: F,
+  sampleAt: ((uv: V2) => F) | null = null,
+): V3 {
   const size = texel
   const swizzle = CHANNEL_INFO.height.swizzle as 'r' | 'g' | 'b' | 'a'
   const at = (dx: number, dy: number): F => {
-    const sample = texture(tex, uvNode.add(vec2(size.x.mul(dx), size.y.mul(dy))))
+    const u = uvNode.add(vec2(size.x.mul(dx), size.y.mul(dy)))
+    if (sampleAt) return sampleAt(u)
+    const sample = texture(tex, u)
     return sample[swizzle] as F
   }
   const dx = at(-1, 0).sub(at(1, 0))

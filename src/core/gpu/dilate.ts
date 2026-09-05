@@ -137,6 +137,33 @@ function dilateIdNode(source: Texture, texelSize: V2): V4 {
   return vec4(filled.x, filled.y, filled.z, written)
 }
 
+const GUTTER_OFFSETS: [number, number][] = [
+  [-1, 0], [1, 0], [0, -1], [0, 1],
+  [-1, -1], [1, -1], [-1, 1], [1, 1],
+]
+
+/**
+ * One ring of padding: empty texels copy a neighbour that sits inside an
+ * island. Covered texels are never written. No iteration, so this cannot
+ * flood across the atlas or into another part.
+ */
+function gutterPadNode(source: Texture, island: Texture, texelSize: V2): V4 {
+  const res = float(1).div(texelSize.x.max(1e-8))
+  const coord = ivec2(uv().mul(res))
+  const own = texture(source).load(coord)
+  const covered = texture(island).load(coord).x
+  let picked: V4 = own as unknown as V4
+  let have: F = step(float(0.5), covered)
+  for (const [dx, dy] of GUTTER_OFFSETS) {
+    const at = coord.add(ivec2(dx, dy))
+    const neighbourCover = texture(island).load(at).x
+    const take = have.oneMinus().mul(step(float(0.5), neighbourCover))
+    picked = mix(picked, texture(source).load(at), take) as V4
+    have = max(have, take) as F
+  }
+  return mix(picked, own, step(float(0.5), covered)) as V4
+}
+
 export class Dilator {
   #quad = new QuadMesh()
   #texelSize = uniform(new Vector2(1 / 1024, 1 / 1024))
@@ -151,6 +178,7 @@ export class Dilator {
   #idMaterialFwd: MeshBasicNodeMaterial | null = null
   #idMaterialBack: MeshBasicNodeMaterial | null = null
   #idScratch: RenderTarget | null = null
+  #gutterMaterial: MeshBasicNodeMaterial | null = null
   #sourceKey = ''
   #blitter = new Blitter()
 
@@ -206,6 +234,42 @@ export class Dilator {
       renderQuad(renderer, this.#quad, fwd, scratch)
       renderQuad(renderer, this.#quad, back, maps.idMap)
     }
+  }
+
+  /**
+   * Copies island colours into empty texels next to an island so a bilinear
+   * sample at a seam vertex does not mix in gutter. Island interiors are
+   * never touched; extra rings only grow into empty atlas.
+   */
+  padCompositeGutter(renderer: Renderer, slots: SlotTargets, islandMask: Texture, rings = 2): void {
+    if (rings <= 0) return
+    const res = slots.resolution
+    this.#texelSize.value.set(1 / res, 1 / res)
+    const scratch = this.#ensureSlotScratch(res)
+    const material = this.#ensureGutterMaterial(slots, islandMask)
+    for (let i = 0; i < rings; i++) {
+      renderQuad(renderer, this.#quad, material, scratch.rt)
+      if (i === 0) renderQuad(renderer, this.#quad, material, scratch.rt)
+      this.#blitter.blit(renderer, scratch.rt.textures, slots.rt, SLOT_NAMES)
+    }
+  }
+
+  #ensureGutterMaterial(slots: SlotTargets, islandMask: Texture): MeshBasicNodeMaterial {
+    const key = `gutter:${slots.texture(0).id}:${islandMask.id}`
+    if (this.#gutterMaterial && this.#gutterMaterial.userData.key === key) return this.#gutterMaterial
+    this.#gutterMaterial?.dispose()
+    const material = new MeshBasicNodeMaterial()
+    material.depthTest = false
+    material.depthWrite = false
+    material.blending = NoBlending
+    material.fragmentNode = mrt(
+      Object.fromEntries(
+        SLOT_NAMES.map((name, i) => [name, gutterPadNode(slots.texture(i), islandMask, this.#texelSize)]),
+      ),
+    )
+    material.userData.key = key
+    this.#gutterMaterial = material
+    return material
   }
 
   #ensureIdMaterial(source: Texture, tag: string): MeshBasicNodeMaterial {
@@ -383,6 +447,7 @@ export class Dilator {
     this.#idMaterialFwd?.dispose()
     this.#idMaterialBack?.dispose()
     this.#idScratch?.dispose()
+    this.#gutterMaterial?.dispose()
     this.#blitter.dispose()
   }
 }
