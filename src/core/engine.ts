@@ -331,9 +331,6 @@ export class Engine {
     }
 
     const changed = this.#compositor.render(renderer, set, this.#meshMaps, this.#paintBuffers)
-    if (changed && !this.#painter.isStroking && this.#meshMaps.geometryBaked) {
-      this.#dilator.dilateComposite(renderer, this.#compositor.output, this.#meshMaps.islandMask.texture, 8)
-    }
 
     if (this.#needsViewportRebuild) {
       measure('viewport material rebuild', () => {
@@ -485,7 +482,7 @@ export class Engine {
     // Nearest-neighbour flood of part IDs into the gutter. Averaging would
     // invent IDs that match nothing; skipping it leaves a 1-texel hole on
     // every UV island border that bilinear filtering turns into a stepped seam.
-    measure('id dilation', () => this.#dilator.dilateId(renderer, this.#meshMaps, 16))
+    measure('id dilation', () => this.#dilator.dilateId(renderer, this.#meshMaps, 4))
     if (options.rebuildGraph === false) this.#compositor.invalidate()
     else this.#compositor.invalidateGraph()
     // The brush graphs read these maps, so they have to be rebuilt too.
@@ -744,7 +741,7 @@ export class Engine {
   endStroke(): void {
     const renderer = this.#renderer
     if (!renderer) return
-    const painted = this.#painter.end(renderer, this.#dilator, 16, this.#meshMaps.islandMask.texture)
+    const painted = this.#painter.end(renderer, this.#dilator, 4, this.#meshMaps.islandMask.texture)
     if (painted) {
       this.#compositeNow()
       this.events.emit('documentChanged', { reason: 'stroke' })
@@ -759,9 +756,6 @@ export class Engine {
     if (!renderer || !set) return
     this.#compositor.invalidate()
     this.#compositor.render(renderer, set, this.#meshMaps, this.#paintBuffers)
-    if (this.#meshMaps.geometryBaked) {
-      this.#dilator.dilateComposite(renderer, this.#compositor.output, this.#meshMaps.islandMask.texture, 8)
-    }
   }
 
   get brushProjection(): ProjectionSettings {

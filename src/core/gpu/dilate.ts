@@ -148,7 +148,6 @@ export class Dilator {
   #coverageScratch: RenderTarget | null = null
   #rayMaterial: MeshBasicNodeMaterial | null = null
   #rayScratch: RenderTarget | null = null
-  #compositeMaterial: MeshBasicNodeMaterial | null = null
   #idMaterialFwd: MeshBasicNodeMaterial | null = null
   #idMaterialBack: MeshBasicNodeMaterial | null = null
   #idScratch: RenderTarget | null = null
@@ -260,29 +259,6 @@ export class Dilator {
     }
   }
 
-  /**
-   * Pads the composited maps into the UV gutter.
-   *
-   * The compositor writes a fullscreen UV pass; mesh vertices on an island
-   * border bilinear-sample the texel *outside* the triangle. Without this,
-   * every UV chart edge — part seams, unique-unwrap cuts, painted islands —
-   * shows up as a stepped halo, independent of ID masks.
-   */
-  dilateComposite(renderer: Renderer, slots: SlotTargets, islandMask: Texture, iterations: number): void {
-    if (iterations <= 0) return
-    const res = slots.resolution
-    this.#texelSize.value.set(1 / res, 1 / res)
-    const scratch = this.#ensureSlotScratch(res)
-    const material = this.#ensureCompositeMaterial(slots, islandMask)
-    renderQuad(renderer, this.#quad, material, scratch.rt)
-    renderQuad(renderer, this.#quad, material, scratch.rt)
-    this.#blitter.blit(renderer, scratch.rt.textures, slots.rt, SLOT_NAMES)
-    for (let i = 1; i < iterations; i++) {
-      renderQuad(renderer, this.#quad, material, scratch.rt)
-      this.#blitter.blit(renderer, scratch.rt.textures, slots.rt, SLOT_NAMES)
-    }
-  }
-
   /** Same, for a painted layer's channel slots and its coverage mask. */
   dilatePaint(renderer: Renderer, buffer: PaintBuffer, iterations: number, islandMask: Texture | null = null): void {
     if (iterations <= 0) return
@@ -363,23 +339,6 @@ export class Dilator {
     return this.#coverageScratch
   }
 
-  #ensureCompositeMaterial(slots: SlotTargets, islandMask: Texture): MeshBasicNodeMaterial {
-    const key = `comp:${slots.texture(0).id}:${islandMask.id}`
-    if (this.#compositeMaterial && this.#compositeMaterial.userData.key === key) return this.#compositeMaterial
-    this.#compositeMaterial?.dispose()
-    const material = new MeshBasicNodeMaterial()
-    material.depthTest = false
-    material.depthWrite = false
-    material.blending = NoBlending
-    const textures = Array.from({ length: SLOT_COUNT }, (_, i) => slots.texture(i))
-    // Island mask is both "what is a valid source" and "only fill the gutter".
-    const { outputs } = dilateNode(textures, islandMask, 'x', this.#texelSize, islandMask)
-    material.fragmentNode = mrt(Object.fromEntries(SLOT_NAMES.map((n, i) => [n, outputs[i]])))
-    material.userData.key = key
-    this.#compositeMaterial = material
-    return material
-  }
-
   #ensureSlotMaterial(buffer: PaintBuffer, islandMask: Texture | null): MeshBasicNodeMaterial {
     const slots = buffer.slots!
     const key = `slots:${slots.texture(0).id}:${islandMask?.id ?? 'none'}`
@@ -421,7 +380,6 @@ export class Dilator {
     this.#coverageScratch?.dispose()
     this.#rayMaterial?.dispose()
     this.#rayScratch?.dispose()
-    this.#compositeMaterial?.dispose()
     this.#idMaterialFwd?.dispose()
     this.#idMaterialBack?.dispose()
     this.#idScratch?.dispose()

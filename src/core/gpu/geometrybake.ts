@@ -106,11 +106,18 @@ export class GeometryBaker {
       Math.max(1e-5, max.z - min.z),
     )
 
-    this.#pass.render(renderer, geometry, this.#buildMaterial(), maps.geometry, true)
+    // Rasterise a 2-texel larger triangle in UV than the mesh actually samples.
+    // Vertex UVs sit on island borders; bilinear then reads the texel *outside*
+    // the triangle. Expanding the bake — not the mesh, not a flood of the
+    // composite — is what covers that neighbourhood without smearing islands
+    // into each other.
+    const expanded = expandTriangleUVs(geometry, maps.resolution, 2)
+    this.#pass.render(renderer, expanded, this.#buildMaterial(), maps.geometry, true)
     // Snapshot which texels are real surface *before* dilation floods the
     // coverage channel outward. Paint padding needs this unflooded answer.
     this.#captureIslandMask(renderer, maps)
-    this.#bakeIdMap(renderer, geometry, maps)
+    this.#bakeIdMap(renderer, expanded, maps)
+    if (expanded !== geometry) expanded.dispose()
     maps.markGeometryBaked(min, max)
     return { min, max }
   }
@@ -132,15 +139,8 @@ export class GeometryBaker {
   }
 
   #bakeIdMap(renderer: Renderer, geometry: BufferGeometry, maps: MeshMaps): void {
-    // Expand each triangle in UV by a couple of texels so pixel centres on
-    // island borders are actually covered. Standard rasterisation leaves those
-    // empty, and a part mask then shows the layer underneath as a stepped seam.
-    const expanded = expandTriangleUVs(geometry, maps.resolution, 2)
-    this.#pass.render(renderer, expanded, this.#buildIdMaterial(), maps.idMap, true)
-    // WebGPU skips the first draw of a new pipeline; a second draw without
-    // clearing recovers the map if the first one was dropped.
-    this.#pass.render(renderer, expanded, this.#buildIdMaterial(), maps.idMap, false)
-    if (expanded !== geometry) expanded.dispose()
+    this.#pass.render(renderer, geometry, this.#buildIdMaterial(), maps.idMap, true)
+    this.#pass.render(renderer, geometry, this.#buildIdMaterial(), maps.idMap, false)
   }
 
   #captureIslandMask(renderer: Renderer, maps: MeshMaps): void {
