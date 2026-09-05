@@ -9,17 +9,19 @@
 import { useApi, useEngineVersion } from '../context'
 import { getMaterialDef } from '../../core/procedural/material'
 import { PROJECTIONS } from '../../core/doc/types'
-import { EmptyHint, NumberField, Row, Segmented, Slider, TextInput } from '../widgets/controls'
+import { EmptyHint, NumberField, Row, Segmented, Slider, TextInput, Toggle } from '../widgets/controls'
 import { MaterialField } from '../widgets/MaterialPicker'
 import { ParamEditor } from '../widgets/ParamEditor'
 
-/** Name and opacity - the two things every layer kind has. */
+/** Name, opacity and the anchor point - what every layer kind has. */
 export function LayerIdentity() {
   const api = useApi()
   useEngineVersion()
   const layerId = api.activeLayerId
   const layer = layerId ? api.getLayer(layerId) : null
   if (!layer || !layerId) return <EmptyHint>Select a layer to edit it.</EmptyHint>
+
+  const anchored = Boolean(layer.anchorName)
 
   return (
     <>
@@ -31,6 +33,24 @@ export function LayerIdentity() {
         max={1}
         onChange={(opacity) => api.setLayerProps(layerId, { opacity })}
       />
+      <Toggle
+        label="Anchor Point"
+        hint="Publishes what this layer produced so layers above it can drive their masks from it - and keep following it as you edit. Free: the stack is one shader, so an anchor is a value it already computed."
+        value={anchored}
+        onChange={(on) => api.setLayerAnchor(layerId, on ? layer.name || 'Anchor' : null)}
+      />
+      {anchored && (
+        <TextInput
+          label="Anchor Name"
+          value={layer.anchorName ?? ''}
+          placeholder="Anchor"
+          hint="How this anchor is listed in the mask panel above."
+          // Clearing the field would otherwise unpublish the anchor and pull
+          // this input out from under the caret. The toggle above is how you
+          // turn it off.
+          onChange={(anchorName) => api.setLayerAnchor(layerId, anchorName.trim() ? anchorName : 'Anchor')}
+        />
+      )}
     </>
   )
 }

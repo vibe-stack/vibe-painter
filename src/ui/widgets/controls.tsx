@@ -252,7 +252,15 @@ export function NumberField({ value, min, max, step = 0.001, onChange, suffix, c
   )
 }
 
-/** A slider and its number field, addressing one value. */
+/**
+ * A slider and its number field, addressing one value.
+ *
+ * `curve="log"` spaces the *track* logarithmically while the field keeps
+ * showing the real number. That is not a cosmetic choice: a brush radius runs
+ * from a fraction of a texel to the whole model, and on a linear track the
+ * entire useful range for detail work lives in the first two pixels of travel.
+ * Requires a positive `min`, which is the only range a log scale has anyway.
+ */
 export function Slider({
   label,
   value,
@@ -261,6 +269,7 @@ export function Slider({
   step = 0.001,
   hint,
   suffix,
+  curve = 'linear',
   onChange,
 }: {
   label: string
@@ -270,9 +279,20 @@ export function Slider({
   step?: number
   hint?: string
   suffix?: string
+  curve?: 'linear' | 'log'
   onChange: (value: number) => void
 }) {
-  const fraction = max > min ? (clamp(value, min, max) - min) / (max - min) : 0
+  const logarithmic = curve === 'log' && min > 0 && max > min
+  const span = Math.log(max / (logarithmic ? min : 1))
+  const toFraction = (v: number): number => {
+    const clamped = clamp(v, min, max)
+    if (logarithmic) return span > 0 ? Math.log(clamped / min) / span : 0
+    return max > min ? (clamped - min) / (max - min) : 0
+  }
+  const fromFraction = (f: number): number =>
+    logarithmic ? min * Math.exp(span * clamp(f, 0, 1)) : min + clamp(f, 0, 1) * (max - min)
+
+  const fraction = toFraction(value)
   return (
     <Row label={label} hint={hint}>
       <div className="flex items-center gap-2">
@@ -286,11 +306,14 @@ export function Slider({
           <input
             type="range"
             className="track relative h-[11px] w-full cursor-pointer"
-            min={min}
-            max={max}
-            step={step}
-            value={clamp(value, min, max)}
-            onChange={(event) => onChange(Number.parseFloat(event.target.value))}
+            min={logarithmic ? 0 : min}
+            max={logarithmic ? 1 : max}
+            step={logarithmic ? 0.0005 : step}
+            value={logarithmic ? fraction : clamp(value, min, max)}
+            onChange={(event) => {
+              const raw = Number.parseFloat(event.target.value)
+              onChange(logarithmic ? fromFraction(raw) : raw)
+            }}
           />
         </div>
         <NumberField

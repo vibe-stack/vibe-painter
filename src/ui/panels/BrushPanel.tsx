@@ -14,8 +14,10 @@ import { useApi, useEngineVersion } from '../context'
 import { BRUSH_ALPHAS } from '../../core/gpu/painter'
 import { getMaterialDef } from '../../core/procedural/material'
 import { EmptyHint, Row, Segmented, Slider, Toggle } from '../widgets/controls'
+import { ParamGroupLabel } from '../widgets/sections'
 import { MaterialField } from '../widgets/MaterialPicker'
 import { ParamEditor } from '../widgets/ParamEditor'
+import { BrushPresetRow } from './SmartMaterials'
 
 export function BrushSection() {
   const api = useApi()
@@ -26,6 +28,18 @@ export function BrushSection() {
   const target = api.engine.paintTarget
   const canPaintLayer = layer?.kind === 'paint'
   const canPaintMask = Boolean(layer?.mask?.paintBufferId)
+
+  // The brush is a sphere in world space, so its useful range is a property of
+  // the model rather than a constant. The floor is deliberately far below one
+  // texel: the position map is precise enough to resolve it now, and a brush
+  // that cannot go finer than a texel is a brush that cannot do detail at all.
+  const modelRadius = Math.max(0.05, api.engine.bounds().radius)
+  const minRadius = modelRadius * 0.001
+  const maxRadius = modelRadius * 1.5
+  const resolution = api.getResolution()
+  // A rough figure, and honest about it: UV density varies across a mesh, so
+  // this is what the brush covers where the parameterisation is even.
+  const texelsAcross = Math.max(0.1, (brush.radius * 2 * resolution) / (modelRadius * 2))
 
   return (
     <>
@@ -45,16 +59,32 @@ export function BrushSection() {
         <EmptyHint>This layer has no paintable mask. Use “Make Paintable” in the Mask section first.</EmptyHint>
       )}
 
+      <ParamGroupLabel>Presets</ParamGroupLabel>
+      <BrushPresetRow />
+
+      <ParamGroupLabel>Shape</ParamGroupLabel>
       <Slider
         label="Radius"
-        hint="In world units, so a bigger model wants a bigger brush."
+        hint="World units, scaled to the model. The track is logarithmic: a linear one puts every detail-sized brush in the first two pixels of travel."
         value={brush.radius}
-        min={0.005}
-        max={1}
-        step={0.001}
+        min={minRadius}
+        max={maxRadius}
+        step={0.0001}
+        curve="log"
         onChange={(radius) => api.setBrush({ radius })}
       />
-      <Slider label="Hardness" value={brush.hardness} min={0} max={1} onChange={(hardness) => api.setBrush({ hardness })} />
+      <p className="px-2 pb-0.5 text-[10px] text-app-faint">
+        About {texelsAcross.toLocaleString(undefined, { maximumFractionDigits: texelsAcross < 10 ? 1 : 0 })} texels
+        across at {resolution}px, where the UVs are even.
+      </p>
+      <Slider
+        label="Hardness"
+        hint="At 1 the edge is still antialiased against the texel size, so a hard brush is crisp rather than jagged."
+        value={brush.hardness}
+        min={0}
+        max={1}
+        onChange={(hardness) => api.setBrush({ hardness })}
+      />
       <Slider
         label="Flow"
         hint="How much a single stamp deposits."
@@ -73,13 +103,14 @@ export function BrushSection() {
       />
       <Slider
         label="Spacing"
-        hint="Stamp spacing as a fraction of the radius. Lower is smoother and slower."
+        hint="Stamp spacing as a fraction of the radius. Lower is smoother; a very fast stroke widens it automatically rather than falling behind the cursor."
         value={brush.spacing}
-        min={0.02}
+        min={0.01}
         max={1}
         step={0.01}
         onChange={(spacing) => api.setBrush({ spacing })}
       />
+
       <Slider
         label="Facing Limit"
         hint="Stops the brush bleeding onto surfaces angled away from the stroke - which is what keeps it off the far side of thin geometry."
@@ -89,7 +120,25 @@ export function BrushSection() {
         onChange={(facing) => api.setBrush({ facing })}
       />
 
-      <Row label="Alpha" hint="Each shape is its own compiled pipeline, so switching one costs a short recompile.">
+      <ParamGroupLabel>Pen Pressure</ParamGroupLabel>
+      <Slider
+        label="Size"
+        hint="How much pressure scales the stamp radius. Ignored by a mouse, which always reports full pressure."
+        value={brush.pressureSize}
+        min={0}
+        max={1}
+        onChange={(pressureSize) => api.setBrush({ pressureSize })}
+      />
+      <Slider
+        label="Flow"
+        hint="How much pressure scales deposition. Size and flow are separate so a stroke can taper without also fading."
+        value={brush.pressureFlow}
+        min={0}
+        max={1}
+        onChange={(pressureFlow) => api.setBrush({ pressureFlow })}
+      />
+      <ParamGroupLabel>Alpha</ParamGroupLabel>
+      <Row label="Shape" hint="Each shape is its own compiled pipeline, so switching one costs a short recompile.">
         <div className="grid grid-cols-3 gap-[3px]">
           {BRUSH_ALPHAS.map((alpha) => (
             <button

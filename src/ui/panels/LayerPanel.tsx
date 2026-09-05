@@ -108,6 +108,17 @@ function LayerRow({ layer, active }: { layer: LayerSummary; active: boolean }) {
           </span>
         </button>
 
+        {/* An anchored layer is one other layers depend on, which is worth
+            seeing from the stack rather than only from the inspector. */}
+        {layer.anchorName && (
+          <span
+            className="shrink-0 text-[9px] text-app-accent"
+            title={`Publishes the anchor point “${layer.anchorName}”`}
+          >
+            ⚓
+          </span>
+        )}
+
         <div className="hidden shrink-0 items-center gap-0.5 group-hover:flex">
           <IconButton title="Move up" onClick={() => shift(api, layer, 1)}>
             ↑

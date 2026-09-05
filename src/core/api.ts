@@ -22,6 +22,8 @@ import type { Unsubscribe } from './emitter'
 import { CHANNELS, CHANNEL_INFO } from './channels'
 import type { Channel } from './channels'
 import type {
+  AnchorRef,
+  AnchorSource,
   BakeSettings,
   BlendMode,
   ChannelSettings,
@@ -37,8 +39,10 @@ import type {
   ProjectState,
   ProjectionSettings,
 } from './doc/types'
-import { BLEND_MODES, DEFAULT_BAKE_SETTINGS, DEFAULT_LEVELS, GENERATOR_TYPES, PROJECTIONS } from './doc/types'
+import { ANCHOR_SOURCES, BLEND_MODES, DEFAULT_BAKE_SETTINGS, DEFAULT_LEVELS, GENERATOR_TYPES, PROJECTIONS } from './doc/types'
 import {
+  anchorsVisibleTo,
+  collectAnchors,
   createFillLayer,
   createFolder,
   createGenerator,
@@ -71,6 +75,8 @@ import { BUILT_IN_MATERIALS, DEFAULT_MATERIAL_ID } from './procedural/catalogue'
 import { describeCatalogue, getMaterialDef, instantiateMaterial, listMaterialDefs } from './procedural/material'
 import { defaultGeneratorParams, describeGenerators, getGeneratorDef, listGeneratorDefs } from './procedural/generators'
 import { BRUSH_ALPHAS } from './gpu/painter'
+import { describeSmartMaterials, getSmartMaterial, listSmartMaterials } from './presets/smart'
+import { BRUSH_PRESETS, describeBrushPresets, getBrushPreset } from './presets/brushes'
 import type { BrushSettings, StrokeSample } from './gpu/painter'
 import { VIEW_MODES } from './gpu/viewport'
 import type { ViewMode } from './gpu/viewport'
@@ -101,6 +107,8 @@ export interface LayerSummary {
   hasMask: boolean
   materialId: string | null
   generatorCount: number
+  /** Name this layer publishes an anchor point under, or null. */
+  anchorName: string | null
 }
 
 export class VibePainter {
@@ -175,6 +183,9 @@ export class VibePainter {
       layerKinds: ['fill', 'paint', 'folder'],
       materials: describeCatalogue(),
       generators: describeGenerators(),
+      smartMaterials: describeSmartMaterials(),
+      brushPresets: describeBrushPresets(),
+      anchorSources: [...ANCHOR_SOURCES],
       brushAlphas: [...BRUSH_ALPHAS],
       viewModes: [...VIEW_MODES],
       primitives: PRIMITIVES.map((p) => ({ id: p.id, name: p.name, description: p.description })),
@@ -279,6 +290,7 @@ export class VibePainter {
           hasMask: layer.mask !== null,
           materialId: layer.kind === 'fill' ? layer.material.defId : null,
           generatorCount: layer.mask?.generators.length ?? 0,
+          anchorName: layer.anchorName ?? null,
         })
         if (layer.kind === 'folder') walk(layer.children, depth + 1, layer.id)
       }
@@ -503,12 +515,17 @@ export class VibePainter {
     }))
   }
 
-  addGenerator(layerId: string, type: GeneratorType, params: Record<string, ParamValue> = {}): string | null {
+  addGenerator(
+    layerId: string,
+    type: GeneratorType,
+    params: Record<string, ParamValue> = {},
+    anchorRef: AnchorRef | null = null,
+  ): string | null {
     const layer = this.getLayer(layerId)
     if (!layer) return null
     if (!getGeneratorDef(type)) throw new Error(`Unknown generator "${type}"`)
     if (!layer.mask) layer.mask = createMask(0)
-    const generator = createGenerator(type, { ...defaultGeneratorParams(type), ...params })
+    const generator = createGenerator(type, { ...defaultGeneratorParams(type), ...params }, anchorRef)
     layer.mask.generators.push(generator)
     this.engine.sync('addGenerator')
     return generator.id
@@ -530,6 +547,8 @@ export class VibePainter {
     patch: Partial<Pick<GeneratorState, 'name' | 'enabled' | 'opacity' | 'blend' | 'invert'>> & {
       params?: Record<string, ParamValue>
       levels?: Partial<Levels>
+      /** Pass `null` to detach an anchor generator from what it was reading. */
+      anchorRef?: AnchorRef | null
     },
   ): boolean {
     const layer = this.getLayer(layerId)
@@ -542,7 +561,117 @@ export class VibePainter {
     if (patch.invert !== undefined) generator.invert = patch.invert
     if (patch.params) Object.assign(generator.params, patch.params)
     if (patch.levels) generator.levels = { ...generator.levels, ...patch.levels }
+    if (patch.anchorRef !== undefined) generator.anchorRef = patch.anchorRef
     this.engine.sync('setGenerator')
+    return true
+  }
+
+  // -- anchor points ------------------------------------------------------
+
+  /**
+   * Publishes (or withdraws) this layer's output as a named anchor point.
+   *
+   * Layers *above* it can then drive their masks from what it produced, and
+   * they keep following it as it is edited - which is the difference between an
+   * anchor and simply duplicating a mask. Costs nothing: the stack is one fused
+   * shader, so an anchor is a node the graph already computed being read twice.
+   */
+  setLayerAnchor(layerId: string, name: string | null): boolean {
+    const layer = this.getLayer(layerId)
+    if (!layer) return false
+    const trimmed = name?.trim() ?? ''
+    layer.anchorName = trimmed.length > 0 ? trimmed : null
+    this.engine.sync('setLayerAnchor')
+    return true
+  }
+
+  /**
+   * Anchor points a layer may reference - those the compositor evaluates before
+   * it. Omit `layerId` for every anchor in the stack.
+   */
+  listAnchors(layerId?: string): { layerId: string; name: string }[] {
+    const set = this.engine.activeTextureSet
+    if (!set) return []
+    return layerId ? anchorsVisibleTo(set.layers, layerId) : collectAnchors(set.layers)
+  }
+
+  /** Points an anchor generator at a published anchor. */
+  setGeneratorAnchor(
+    layerId: string,
+    generatorId: string,
+    anchor: { layerId: string; source?: AnchorSource } | null,
+  ): boolean {
+    return this.setGenerator(layerId, generatorId, {
+      anchorRef: anchor ? { layerId: anchor.layerId, source: anchor.source ?? 'mask' } : null,
+    })
+  }
+
+  // -- smart materials and brush presets ----------------------------------
+
+  listSmartMaterials() {
+    return listSmartMaterials().map((def) => ({
+      id: def.id,
+      name: def.name,
+      category: def.category,
+      description: def.description,
+      requiresBake: def.requiresBake,
+      swatch: def.swatch,
+    }))
+  }
+
+  /**
+   * Drops a built-in smart material on the stack: a whole effect - its fill,
+   * its mask, its generators and any anchors tying them together - as one
+   * editable group rather than a baked result.
+   */
+  addSmartMaterial(
+    presetId: string,
+    options: { parentId?: string | null; index?: number; partId?: number } = {},
+  ): string {
+    const set = this.#requireSet()
+    const preset = getSmartMaterial(presetId)
+    if (!preset) throw new Error(`Unknown smart material "${presetId}"`)
+    const layer = preset.build()
+
+    // Dropped onto one region of the source mesh: gate the whole group by ID,
+    // the same way a catalogue material drop does.
+    const parts = this.listMeshParts()
+    const part = options.partId !== undefined ? parts.find((entry) => entry.index === options.partId) : null
+    if (part && parts.length >= 2) {
+      const mask = layer.mask ?? createMask(1)
+      const generator = createGenerator('idSelect', { partId: part.index })
+      generator.name = part.name
+      generator.blend = 'multiply'
+      // Base 1 with a multiply: an ID gate restricts what is already there
+      // rather than being one more thing that has to add up to visible.
+      if (!layer.mask) mask.base = 1
+      mask.generators.push(generator)
+      layer.mask = mask
+      layer.name = `${layer.name} · ${part.name}`
+    }
+
+    insertLayer(set, layer, options.parentId ?? null, options.index)
+    this.engine.project.activeLayerId = layer.id
+    this.engine.sync('addSmartMaterial')
+    return layer.id
+  }
+
+  listBrushPresets() {
+    return BRUSH_PRESETS.map((preset) => ({
+      id: preset.id,
+      name: preset.name,
+      description: preset.description,
+      materialId: preset.materialId,
+      swatch: preset.swatch,
+    }))
+  }
+
+  /** Sets the brush and its material from a preset. Touches no document state. */
+  applyBrushPreset(presetId: string): boolean {
+    const preset = getBrushPreset(presetId)
+    if (!preset) throw new Error(`Unknown brush preset "${presetId}"`)
+    this.engine.setBrushMaterial(preset.materialId, preset.materialParams ?? {})
+    this.engine.setBrush(preset.brush)
     return true
   }
 
@@ -611,6 +740,16 @@ export class VibePainter {
     this.engine.setIdHover(partId)
   }
 
+  /**
+   * Same, for a smart material. The overlay carries no material id: a preset is
+   * a layer stack rather than a catalogue entry, so there is no single shader
+   * to name in the hint.
+   */
+  beginSmartMaterialDrag(presetId: string): void {
+    if (!getSmartMaterial(presetId)) throw new Error(`Unknown smart material "${presetId}"`)
+    this.engine.setIdOverlay(true, null)
+  }
+
   endMaterialDrag(): void {
     this.engine.setIdOverlay(false)
   }
@@ -622,6 +761,11 @@ export class VibePainter {
   dropMaterial(defId: string, partId: number | null = null): string {
     if (!getMaterialDef(defId)) throw new Error(`Unknown material "${defId}"`)
     return this.addFillLayer({ materialId: defId, partId: partId ?? undefined })
+  }
+
+  /** As `dropMaterial`, for a smart material preset. */
+  dropSmartMaterial(presetId: string, partId: number | null = null): string {
+    return this.addSmartMaterial(presetId, { partId: partId ?? undefined })
   }
 
   // -- baking -------------------------------------------------------------
@@ -754,6 +898,8 @@ function roundToPowerOfTwo(value: number): number {
 }
 
 export type {
+  AnchorRef,
+  AnchorSource,
   BakeProgress,
   BrushSettings,
   Channel,
@@ -772,4 +918,4 @@ export type {
   SurfaceHit,
   ViewMode,
 }
-export { GENERATOR_TYPES, BLEND_MODES, PROJECTIONS, VIEW_MODES, DEFAULT_LEVELS }
+export { ANCHOR_SOURCES, GENERATOR_TYPES, BLEND_MODES, PROJECTIONS, VIEW_MODES, DEFAULT_LEVELS }

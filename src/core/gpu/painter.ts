@@ -37,11 +37,14 @@ import {
   Fn,
   If,
   Loop,
+  dFdx,
+  dFdy,
   dot,
   int,
   float,
   length,
   max,
+  min,
   mix,
   mrt,
   smoothstep,
@@ -71,6 +74,20 @@ import type { Dilator } from './dilate'
 /** Stamps evaluated per draw. Longer batches are split across draws. */
 const MAX_STAMPS = 64
 
+/**
+ * Ceiling on the stamps one pointer segment may lay down.
+ *
+ * Spacing is a fraction of the radius, so a fine brush dragged fast asks for an
+ * unbounded number of stamps: at a radius of 0.002 with 5% spacing, a pointer
+ * that moved half a unit between frames wants five thousand of them, which is
+ * eighty draws in a single frame. The stroke then runs further behind the
+ * cursor with every frame and fine painting becomes unusable exactly where it
+ * matters. Past this count the segment's spacing is widened to fit; the visible
+ * result is a slightly sparser dash on a very fast flick, which is what every
+ * other painting application does too.
+ */
+const MAX_STAMPS_PER_SEGMENT = 256
+
 export const BRUSH_ALPHAS = ['round', 'square', 'speckle', 'splatter', 'streaks'] as const
 export type BrushAlpha = (typeof BRUSH_ALPHAS)[number]
 
@@ -85,6 +102,10 @@ export interface BrushSettings {
   opacity: number
   /** Stamp spacing as a fraction of the radius. */
   spacing: number
+  /** How much pen pressure scales the stamp radius. 0 = fixed size. */
+  pressureSize: number
+  /** How much pen pressure scales per-stamp deposition. */
+  pressureFlow: number
   alpha: BrushAlpha
   /** Scale of the procedural alpha pattern, relative to the brush footprint. */
   alphaScale: number
@@ -99,10 +120,16 @@ export interface BrushSettings {
 
 export const DEFAULT_BRUSH: BrushSettings = {
   radius: 0.08,
-  hardness: 0.5,
+  // Hard by default. The falloff is antialiased against the texel size now
+  // (see `#stampMaterialFor`), so a hard edge reads as a clean edge rather
+  // than a staircase - and a soft default is what made every stroke look
+  // airbrushed no matter how small the brush was.
+  hardness: 0.85,
   flow: 1,
   opacity: 1,
-  spacing: 0.15,
+  spacing: 0.08,
+  pressureSize: 1,
+  pressureFlow: 0.5,
   alpha: 'round',
   alphaScale: 1,
   alphaContrast: 0.5,
@@ -505,7 +532,7 @@ export class Painter {
     if (!active) return
 
     const point = new Vector3(...sample.point)
-    const step = Math.max(1e-4, active.brush.spacing * active.brush.radius)
+    const spacing = Math.max(1e-5, active.brush.spacing * active.brush.radius)
 
     if (!active.lastPoint) {
       active.pending.push(sample)
@@ -515,7 +542,11 @@ export class Painter {
       const from = active.lastPoint
       const distance = from.distanceTo(point)
       if (distance > 0) {
-        let travelled = step - active.carry
+        // Widen the spacing rather than emit thousands of stamps for one flick.
+        const step = Math.max(spacing, distance / MAX_STAMPS_PER_SEGMENT)
+        // The carry was measured against the *previous* segment's step, which
+        // may have been wider; it cannot push the first stamp behind the start.
+        let travelled = step - Math.min(active.carry, step)
         while (travelled <= distance) {
           const t = travelled / distance
           active.pending.push({
@@ -558,9 +589,13 @@ export class Painter {
         const s = batch[i]
         const posValue = this.#stampPos.array[i]
         const nrmValue = this.#stampNrm.array[i]
-        posValue.set(s.point[0], s.point[1], s.point[2], active.brush.radius)
+        // Pressure drives size and flow independently, each with its own
+        // amount, so a tablet can taper a stroke without also fading it out.
+        const pressure = clamp01(s.pressure ?? 1)
+        const sized = active.brush.radius * lerp(1, pressure, active.brush.pressureSize)
+        posValue.set(s.point[0], s.point[1], s.point[2], Math.max(1e-5, sized))
         const n = normaliseVector(s.normal)
-        nrmValue.set(n[0], n[1], n[2], s.pressure ?? 1)
+        nrmValue.set(n[0], n[1], n[2], lerp(1, pressure, active.brush.pressureFlow))
       }
       this.#stampCount.value = batch.length
       renderQuad(renderer, this.#quad, this.#stampMaterialFor(maps, active.brush.alpha), this.#stroke.rt)
@@ -601,12 +636,33 @@ export class Painter {
     const uvNode = uv()
     const surface = maps.nodes(uvNode)
 
+    // How much world space one texel spans, here.
+    //
+    // This pass runs one fragment per texel, so a screen-space derivative of
+    // the surface position *is* the world size of a texel - and that is the
+    // width below which a falloff cannot be resolved. Clamping the ramp to it
+    // is what lets hardness go to 1 and give a clean edge instead of a
+    // staircase: the last texel of the stamp gets a partial value.
+    //
+    // Measured on the coarse position rather than the precise one, which is
+    // discontinuous at island borders by construction (it falls back to coarse
+    // in the gutter) and would report an enormous derivative there. Built out
+    // here rather than inside the `Fn`, alongside every other derivative in
+    // this codebase: WGSL requires them in uniform control flow.
+    const texelWorld = max(length(dFdx(surface.worldPosition)), length(dFdy(surface.worldPosition)))
+
     const coverageFn = Fn(() => {
       // Sample the mesh maps once, into locals, *before* any control flow.
       // WGSL requires texture sampling to happen in uniform control flow, and
       // these are loop-invariant anyway - reading them inside the `If` is both
       // undefined behaviour and pure waste.
-      const surfacePosition = surface.worldPosition.toVar('brushSurfacePos')
+      //
+      // The *precise* position, not the coarse one. This pass is 1:1 over the
+      // texture set, which is the condition that reconstruction needs, and the
+      // coarse map quantises position to about a texel at 2K - which is to say
+      // the brush could not resolve anything finer than a texel no matter how
+      // small it was set. See `MeshMaps.nodes()`.
+      const surfacePosition = surface.worldPositionPrecise.toVar('brushSurfacePos')
       const surfaceNormal = surface.normal.toVar('brushSurfaceNormal')
       const surfaceTangent = surface.tangent.toVar('brushSurfaceTangent')
       const surfaceBitangent = surface.bitangent.toVar('brushSurfaceBitangent')
@@ -623,10 +679,20 @@ export class Painter {
         const delta = surfacePosition.sub(centre)
         const distance = length(delta)
 
-        // Radial falloff. Hardness moves the inner edge of the ramp outward.
-        // Forward edges only: WGSL leaves smoothstep indeterminate when
-        // low >= high, which silently broke the whole brush falloff.
-        const inner = radius.mul(this.#hardness.clamp(0, 0.99))
+        // Radial falloff. Hardness narrows the ramp; the texel width sets the
+        // floor, so the hardest brush still lands antialiased rather than
+        // aliased. Forward edges only: WGSL leaves smoothstep indeterminate
+        // when low >= high, which silently broke the whole brush falloff.
+        const softness = max(
+          max(
+            radius.mul(this.#hardness.oneMinus().clamp(0, 1)),
+            min(texelWorld.mul(0.8), radius.mul(0.5)),
+          ),
+          // A degenerate derivative (a fully collapsed chart) would otherwise
+          // leave low == high, which WGSL leaves indeterminate.
+          radius.mul(1e-3),
+        )
+        const inner = radius.sub(softness).max(float(0))
         const radial = smoothstep(inner, radius, distance).oneMinus()
 
         // Almost every texel is outside almost every stamp, so reject on the
@@ -803,6 +869,14 @@ export class Painter {
     for (const material of this.#brushSourceMaterials.values()) material.dispose()
     this.#brushSourceMaterials.clear()
   }
+}
+
+function clamp01(value: number): number {
+  return Math.min(1, Math.max(0, value))
+}
+
+function lerp(from: number, to: number, amount: number): number {
+  return from + (to - from) * Math.min(1, Math.max(0, amount))
 }
 
 function normaliseVector(v: [number, number, number]): [number, number, number] {

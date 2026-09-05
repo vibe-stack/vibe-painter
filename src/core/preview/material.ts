@@ -65,6 +65,7 @@ function previewMeshMaps(): MeshMapNodes {
   return {
     position: (positionLocal as unknown as V3).mul(0.5).add(vec3(0.5, 0.5, 0.5)),
     worldPosition: positionLocal as unknown as V3,
+    worldPositionPrecise: positionLocal as unknown as V3,
     normal: safeNormalize(normalLocal as unknown as V3, vec3(0, 0, 1)),
     tangent: safeNormalize(tangentLocal as unknown as V3, vec3(1, 0, 0)),
     bitangent: safeNormalize(bitangentLocal as unknown as V3, vec3(0, 1, 0)),

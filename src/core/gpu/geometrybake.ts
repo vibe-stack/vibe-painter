@@ -12,6 +12,7 @@ import { MeshBasicNodeMaterial, NoBlending, NodeMaterial, QuadMesh, Vector3 } fr
 import type { BufferGeometry, Renderer } from 'three/webgpu'
 import {
   attribute,
+  floor,
   mrt,
   modelNormalMatrix,
   modelWorldMatrix,
@@ -26,7 +27,7 @@ import {
   vec4,
 } from 'three/tsl'
 import { PART_ID_ATTRIBUTE } from '../mesh/parts'
-import { GEOMETRY_MAP_NAMES, MeshMaps } from './meshmaps'
+import { GEOMETRY_MAP_NAMES, MeshMaps, POSITION_SPLIT } from './meshmaps'
 import type { F } from './nodes'
 import { UVSpacePass, renderQuad, uvClipPosition } from './uvspace'
 
@@ -64,6 +65,17 @@ export class GeometryBaker {
     const worldNormal = normalize(modelNormalMatrix.mul(normalLocal))
     const worldTangent = normalize(modelWorldMatrix.mul(vec4(tangentLocal, 0)).xyz)
 
+    // The bits the half-float position map cannot hold.
+    //
+    // `normalised` is a float32 varying here, so it carries the full precision
+    // of the rasterised triangle; the attachment it lands in does not. Writing
+    // the fractional part of a 256x magnification into a second attachment
+    // keeps that precision available to anything that reads both, and one
+    // `round()` on the way back recovers which period a texel belongs to. See
+    // `MeshMaps.nodes()`.
+    const scaledPosition = normalised.mul(POSITION_SPLIT)
+    const finePosition = scaledPosition.sub(floor(scaledPosition))
+
     material.fragmentNode = mrt({
       [GEOMETRY_MAP_NAMES[0]]: vec4(normalised, 1),
       // Handedness rides in .w so the bitangent can be reconstructed with a
@@ -71,6 +83,7 @@ export class GeometryBaker {
       // (bitangent = cross(normal, tangent) * tangent.w).
       [GEOMETRY_MAP_NAMES[1]]: vec4(worldNormal, tangentGeometry.w),
       [GEOMETRY_MAP_NAMES[2]]: vec4(worldTangent, 0),
+      [GEOMETRY_MAP_NAMES[3]]: vec4(finePosition, 1),
     })
     this.#material = material
     return material

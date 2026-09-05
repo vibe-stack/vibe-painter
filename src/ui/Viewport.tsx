@@ -23,7 +23,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import type { VibePainter } from '../core/api'
 import type { SurfaceHit } from '../core/engine'
 import { useApi } from './context'
-import { isMaterialDrag, materialIdFromDrop } from './drag'
+import { isMaterialDrag, materialIdFromDrop, smartIdFromDrop } from './drag'
 
 export type Tool = 'orbit' | 'paint' | 'erase'
 
@@ -97,6 +97,20 @@ interface PendingSample {
   x: number
   y: number
   pressure: number
+}
+
+/**
+ * Pen pressure, with mice excluded.
+ *
+ * A mouse reports 0.5 while a button is down - that is the specified value, not
+ * a quirk - so feeding `event.pressure` straight through means every mouse
+ * stroke paints at half pressure. That was survivable while pressure only
+ * scaled flow; now that it also scales the brush radius it would silently halve
+ * the size of every stroke anyone drew without a tablet.
+ */
+function pressureOf(event: PointerEvent): number {
+  if (event.pointerType === 'mouse') return 1
+  return event.pressure > 0 ? event.pressure : 1
 }
 
 function Stage({ api, tool, onPaintBlocked }: ViewportProps & { api: VibePainter }) {
@@ -192,7 +206,7 @@ function Stage({ api, tool, onPaintBlocked }: ViewportProps & { api: VibePainter
       if (event.button !== 0) return
       const hit = hitAt(event.clientX, event.clientY)
       if (!hit) return
-      const started = api.beginStroke({ point: hit.point, normal: hit.normal, pressure: event.pressure || 1 })
+      const started = api.beginStroke({ point: hit.point, normal: hit.normal, pressure: pressureOf(event) })
       if (!started) {
         onPaintBlocked('Select a paint layer, or make the layer mask paintable, before painting.')
         return
@@ -208,7 +222,7 @@ function Stage({ api, tool, onPaintBlocked }: ViewportProps & { api: VibePainter
       // The newest position always wins; the frame loop consumes it. It is
       // recorded whether or not a stroke is in progress, because the brush ring
       // has to follow the pointer before you press too.
-      pending.current = { x: event.clientX, y: event.clientY, pressure: event.pressure || 1 }
+      pending.current = { x: event.clientX, y: event.clientY, pressure: pressureOf(event) }
     }
 
     const onLeave = () => {
@@ -268,14 +282,16 @@ function Stage({ api, tool, onPaintBlocked }: ViewportProps & { api: VibePainter
     }
 
     const onDrop = (event: DragEvent) => {
-      const defId = materialIdFromDrop(event)
-      if (!defId) return
+      const smartId = smartIdFromDrop(event)
+      const defId = smartId ? null : materialIdFromDrop(event)
+      if (!smartId && !defId) return
       event.preventDefault()
       event.stopPropagation()
       const hit = hitAt(event.clientX, event.clientY)
       const parts = api.listMeshParts()
       const partId = parts.length >= 2 ? (hit?.partId ?? null) : null
-      api.dropMaterial(defId, partId)
+      if (smartId) api.dropSmartMaterial(smartId, partId)
+      else api.dropMaterial(defId!, partId)
       api.endMaterialDrag()
     }
 

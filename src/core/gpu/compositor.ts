@@ -38,6 +38,7 @@ import { CHANNEL_LIST } from '../channels'
 import type { LayerState, TextureSetState } from '../doc/types'
 import { channelSettings } from '../doc/document'
 import { getGeneratorDef } from '../procedural/generators'
+import type { AnchorOutputs } from '../procedural/generators'
 import { getMaterialDef } from '../procedural/material'
 import { buildProjected } from '../procedural/projection'
 import type { ProjectionNodes } from '../procedural/projection'
@@ -62,6 +63,15 @@ interface BuildContext {
   maps: MeshMaps
   mapNodes: ReturnType<MeshMaps['nodes']>
   buffers: Map<string, PaintBuffer>
+  /**
+   * Anchor points published so far by the bottom-up walk.
+   *
+   * Filled as `#evalStack` passes each anchored layer, so a generator only ever
+   * sees anchors from *below* it - which is both the rule Painter enforces and
+   * the only order a single fused shader can evaluate in. A reference upward
+   * finds nothing and contributes nothing.
+   */
+  anchors: Map<string, AnchorOutputs>
 }
 
 export class Compositor {
@@ -263,12 +273,19 @@ export class Compositor {
       maps,
       mapNodes: maps.nodes(uvNode),
       buffers,
+      anchors: new Map(),
     }
 
     // Split the stack if a stroke is running on anything but the bottom layer.
-    const split = this.#strokeLayerId === null
+    //
+    // Unless an anchor crosses the cut. Freezing the lower half into a texture
+    // throws away every node in it, and an anchor is a node - so a generator
+    // above the split would silently lose the layer it references for the
+    // duration of the stroke, which is exactly when you are watching it.
+    let split = this.#strokeLayerId === null
       ? -1
       : set.layers.findIndex((layer) => containsLayer(layer, this.#strokeLayerId!))
+    if (split > 0 && anchorsCrossSplit(set.layers, split)) split = -1
     let base = defaultBundle()
     let layers = set.layers
     if (split > 0) {
@@ -401,7 +418,12 @@ export class Compositor {
       const binding = this.#bindings.get(layer.id)
       if (!binding) continue
 
-      let amount: F = binding.opacity.mul(this.#maskValue(layer, binding, ctx))
+      const maskValue = this.#maskValue(layer, binding, ctx)
+      // What the layer is masked to, without its global opacity: that is the
+      // shape an anchor publishes, and multiplying opacity into it would make
+      // "hide this layer" quietly rewrite every mask that references it.
+      let anchorMask: F = maskValue
+      let amount: F = binding.opacity.mul(maskValue)
       let src: ChannelBundle | null = null
 
       if (layer.kind === 'folder') {
@@ -433,8 +455,16 @@ export class Compositor {
         if (buffer?.slots) {
           src = unpackSlots(buffer.slots.rt.textures, ctx.uv, ctx.coord)
           // Painted pixels only exist where the brush actually landed.
-          amount = amount.mul(coverageOf(buffer, ctx))
+          const coverage = coverageOf(buffer, ctx)
+          amount = amount.mul(coverage)
+          // Which is also the useful thing to anchor on a paint layer: "where
+          // I painted", with or without a mask on top of it.
+          anchorMask = anchorMask.mul(coverage)
         }
+      }
+
+      if (layer.anchorName && src) {
+        ctx.anchors.set(layer.id, { mask: anchorMask.clamp(0, 1), bundle: src })
       }
 
       if (src) dst = combineBundles(dst, src, amount, layer, binding)
@@ -457,6 +487,8 @@ export class Compositor {
         texel: ctx.texel,
         params: genBinding.params,
         meshMaps: ctx.mapNodes,
+        anchors: ctx.anchors,
+        anchorRef: gen.anchorRef ?? null,
       })
       contribution = genBinding.levels.apply(contribution)
       if (gen.invert) contribution = contribution.oneMinus()
@@ -500,6 +532,29 @@ export class Compositor {
 
 function coverageOf(buffer: PaintBuffer, ctx: BuildContext): F {
   return blurredCoverage(buffer.coverage.texture, ctx.uv, null, ctx.coord)
+}
+
+/**
+ * Whether any layer at or above `split` reads an anchor published below it.
+ *
+ * Cheap: this runs once per graph build, over the document, not per texel.
+ */
+function anchorsCrossSplit(layers: LayerState[], split: number): boolean {
+  const below = new Set<string>()
+  for (const layer of layers.slice(0, split)) {
+    walk([layer], (node) => {
+      if (node.anchorName) below.add(node.id)
+    })
+  }
+  if (below.size === 0) return false
+
+  let crosses = false
+  walk(layers.slice(split), (node) => {
+    for (const gen of node.mask?.generators ?? []) {
+      if (gen.anchorRef && below.has(gen.anchorRef.layerId)) crosses = true
+    }
+  })
+  return crosses
 }
 
 /** Whether `id` is `layer` or lives anywhere inside it. */
@@ -576,7 +631,12 @@ function structureKey(set: TextureSetState): string {
       const mask = layer.mask
       const maskKey = mask
         ? `m(${mask.enabled ? 1 : 0},${mask.invert ? 1 : 0},${mask.paintBufferId ?? '-'},${mask.paintBlend},${mask.blur > 0 ? 1 : 0},${mask.generators
-            .map((g) => `${g.type}:${g.enabled ? 1 : 0}:${g.blend}:${g.invert ? 1 : 0}`)
+            .map(
+              (g) =>
+                `${g.type}:${g.enabled ? 1 : 0}:${g.blend}:${g.invert ? 1 : 0}:${
+                  g.anchorRef ? `${g.anchorRef.layerId}>${g.anchorRef.source}` : '-'
+                }`,
+            )
             .join('|')})`
         : 'm-'
 
@@ -584,7 +644,11 @@ function structureKey(set: TextureSetState): string {
       if (layer.kind === 'fill') kindKey += `:${layer.material.defId}:${layer.projection.mode}:${layer.projection.axis}`
       if (layer.kind === 'paint') kindKey += `:${layer.paintBufferId}`
 
-      parts.push(`${depth}|${layer.id}|${kindKey}|${layer.visible ? 1 : 0}|${channels}|${maskKey}`)
+      // The anchor's *name* is presentation; whether it is published is not -
+      // a layer that starts publishing adds a node other masks can reach.
+      parts.push(
+        `${depth}|${layer.id}|${kindKey}|${layer.visible ? 1 : 0}|${layer.anchorName ? 1 : 0}|${channels}|${maskKey}`,
+      )
       if (layer.kind === 'folder') encode(layer.children, depth + 1)
     }
   }

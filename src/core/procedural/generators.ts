@@ -11,19 +11,38 @@
  * of those pushed through levels and broken up with noise.
  */
 
-import { abs, dot, float, max, mix, normalize, smoothstep, vec3 } from 'three/tsl'
-import type { GeneratorType, ParamValue } from '../doc/types'
-import type { F, V2, V3 } from '../gpu/nodes'
-import { fbm01, ridged, voronoi2, voronoiBorder, warp } from './noise'
+import { abs, dot, float, max, mix, normalize, smoothstep, vec2, vec3 } from 'three/tsl'
+import type { AnchorRef, AnchorSource, GeneratorType, ParamValue } from '../doc/types'
+import type { ChannelBundle, F, V2, V3 } from '../gpu/nodes'
+import { fbm01, ridged, scratches as scratchField, voronoi2, voronoiBorder, warp } from './noise'
 import type { MeshMapNodes } from './material'
 import type { ParamDef } from './params'
 import { ParamBag, defaultValues } from './params'
+
+/**
+ * What one anchored layer offers the layers above it.
+ *
+ * These are live nodes from the *same* fused shader, not a rendered texture.
+ * The compositor already computed this layer's mask and its channel bundle on
+ * the way past; an anchor is simply a name kept on them so a generator further
+ * up can wire itself to the node instead of recomputing anything.
+ */
+export interface AnchorOutputs {
+  /** The layer's mask, including where a paint layer's brush actually landed. */
+  mask: F
+  /** What the layer itself produced, before it was blended into the stack. */
+  bundle: ChannelBundle
+}
 
 export interface GenContext {
   uv: V2
   texel: F
   params: ParamBag
   meshMaps: MeshMapNodes
+  /** Anchor points published *below* this generator's layer, keyed by layer id. */
+  anchors: Map<string, AnchorOutputs>
+  /** The anchor this generator instance was pointed at, if any. */
+  anchorRef: AnchorRef | null
 }
 
 export interface GeneratorDef {
@@ -241,6 +260,82 @@ register({
     return match.mul(ctx.meshMaps.coverage)
   },
 })
+
+
+register({
+  type: 'scratches',
+  name: 'Scratches',
+  description:
+    'Directional scuffs and brush marks. Pure noise, so it needs no bake - but it can be biased towards exposed edges once one exists, which is what stops scratches reading as wallpaper.',
+  requiresBake: false,
+  params: [
+    { key: 'angle', label: 'Angle', type: 'float', default: 0.4, min: -3.15, max: 3.15, step: 0.01, group: 'Scratches' },
+    { key: 'density', label: 'Density', type: 'float', default: 26, min: 1, max: 300, step: 0.5, group: 'Scratches' },
+    { key: 'stretch', label: 'Stretch', type: 'float', default: 26, min: 1, max: 200, step: 0.5, group: 'Scratches', description: 'How far each mark is drawn out along the angle. High values give long hairline scratches.' },
+    { key: 'amount', label: 'Amount', type: 'float', default: 0.7, min: 0, max: 1, step: 0.01, group: 'Scratches' },
+    { key: 'edgeBias', label: 'Edge Bias', type: 'float', default: 0, min: 0, max: 1, step: 0.01, group: 'Scratches', description: 'Concentrates the marks on convex edges, where something would actually have scraped past. Needs a bake.' },
+    { key: 'seed', label: 'Seed', type: 'float', default: 0, min: 0, max: 100, step: 0.01, group: 'Scratches' },
+  ],
+  build(ctx) {
+    const p = ctx.params
+    const seed = p.float('seed').mul(7.3)
+    const coord = ctx.uv.add(vec2(seed, seed.mul(0.37)))
+    const field = scratchField(coord, p.float('angle'), max(p.float('stretch'), float(1)), max(p.float('density'), float(0.01)))
+    const edges = smoothstep(float(0.5), float(0.62), ctx.meshMaps.curvature)
+    const biased = field.mul(mix(float(1), edges, p.float('edgeBias')))
+    return biased.mul(p.float('amount')).clamp(0, 1)
+  },
+})
+
+register({
+  type: 'anchor',
+  name: 'Anchor Point',
+  description:
+    'Reads what another layer produced. Point it at a layer that publishes an anchor and this mask follows that layer as it is edited - paint a chip, then let rust find it, then let grime find the rust.',
+  requiresBake: false,
+  params: [
+    { key: 'contrast', label: 'Contrast', type: 'float', default: 0, min: 0, max: 0.98, step: 0.01, group: 'Anchor', description: 'Tightens the midtones. At 0 the anchor comes through exactly as it is.' },
+    { key: 'balance', label: 'Balance', type: 'float', default: 0.5, min: 0, max: 1, step: 0.01, group: 'Anchor', description: 'Where the contrast pivots. Below 0.5 keeps more of the anchor, above 0.5 keeps only its strongest parts.' },
+    ...GRUNGE_PARAMS,
+  ],
+  build(ctx) {
+    const ref = ctx.anchorRef
+    const outputs = ref ? ctx.anchors.get(ref.layerId) : undefined
+    // No anchor selected, or one that lives *above* this layer and therefore
+    // has not been evaluated yet. Contributing nothing is the honest answer;
+    // the mask panel says so in words.
+    if (!ref || !outputs) return float(0)
+
+    const raw = anchorValue(outputs, ref.source).clamp(0, 1)
+    const contrast = ctx.params.float('contrast').clamp(0, 0.98)
+    const balance = ctx.params.float('balance')
+    // At contrast 0 the window spans the whole range and the mix weight is 0,
+    // so the anchor comes through untouched; as it rises the window closes
+    // around `balance` until the anchor reads as a hard selection. Kept off
+    // zero width because WGSL leaves smoothstep indeterminate at low == high.
+    const width = max(contrast.oneMinus(), float(0.02)).mul(0.5)
+    const shaped = smoothstep(balance.sub(width), balance.add(width), raw)
+    return mix(raw, shaped, contrast).mul(grunge(ctx))
+  },
+})
+
+/** Pulls one scalar out of an anchored layer's outputs. */
+function anchorValue(outputs: AnchorOutputs, source: AnchorSource): F {
+  switch (source) {
+    case 'height':
+      return outputs.bundle.height
+    case 'luminance':
+      return dot(outputs.bundle.baseColor, vec3(0.2126, 0.7152, 0.0722))
+    case 'opacity':
+      return outputs.bundle.opacity
+    case 'roughness':
+      return outputs.bundle.roughness
+    case 'ao':
+      return outputs.bundle.ao
+    default:
+      return outputs.mask
+  }
+}
 
 // ---------------------------------------------------------------------------
 

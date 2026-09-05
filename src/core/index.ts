@@ -34,7 +34,11 @@ export {
 export type { MatContext, MeshMapNodes, ProceduralMaterialDef } from './procedural/material'
 export type { ParamDef, ParamType } from './procedural/params'
 export { describeGenerators, getGeneratorDef, listGeneratorDefs } from './procedural/generators'
-export type { GeneratorDef } from './procedural/generators'
+export type { AnchorOutputs, GeneratorDef } from './procedural/generators'
+export { describeSmartMaterials, getSmartMaterial, listSmartMaterials } from './presets/smart'
+export type { SmartMaterialDef } from './presets/smart'
+export { BRUSH_PRESETS, describeBrushPresets, getBrushPreset } from './presets/brushes'
+export type { BrushPreset } from './presets/brushes'
 export * as noise from './procedural/noise'
 
 export { DEFAULT_BRUSH, BRUSH_ALPHAS } from './gpu/painter'

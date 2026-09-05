@@ -77,10 +77,31 @@ export const GENERATOR_TYPES = [
   'thickness',
   'lightDirt',
   'grunge',
+  'scratches',
   'fill',
   'idSelect',
+  'anchor',
 ] as const
 export type GeneratorType = (typeof GENERATOR_TYPES)[number]
+
+/**
+ * What an anchored layer exposes to the layers above it.
+ *
+ * `mask` is the layer's own mask (and, for a paint layer, where the brush
+ * actually landed) - the usual reason to anchor something. The rest read the
+ * layer's *content*, which is how a "dirt settles into the crevices I just
+ * carved" effect is built: anchor the layer that carries the height, then drive
+ * a dirt layer's mask from it.
+ */
+export const ANCHOR_SOURCES = ['mask', 'height', 'luminance', 'opacity', 'roughness', 'ao'] as const
+export type AnchorSource = (typeof ANCHOR_SOURCES)[number]
+
+/** A generator's reference to an anchor point published lower in the stack. */
+export interface AnchorRef {
+  /** Id of the layer that publishes the anchor. */
+  layerId: string
+  source: AnchorSource
+}
 
 /**
  * One entry in a mask's own little stack. Generators read baked mesh maps (or
@@ -97,6 +118,14 @@ export interface GeneratorState {
   params: Record<string, ParamValue>
   levels: Levels
   invert: boolean
+  /**
+   * Which anchor point this generator reads. Only meaningful for the `anchor`
+   * generator; null everywhere else.
+   *
+   * Kept out of `params` on purpose: parameters are numeric and bind to
+   * uniforms, and a layer id is neither.
+   */
+  anchorRef: AnchorRef | null
 }
 
 export interface MaskState {
@@ -123,6 +152,15 @@ interface LayerBase {
   /** Per-channel enable / opacity / blend mode. Missing entries use defaults. */
   channels: Partial<Record<Channel, ChannelSettings>>
   mask: MaskState | null
+  /**
+   * Name under which this layer publishes an anchor point, or null.
+   *
+   * An anchor is a reference, not a copy: layers *above* this one can drive
+   * their masks from what this layer produced, and they follow it as it is
+   * edited. Publishing costs nothing - the whole stack is one fused shader, so
+   * an anchor is a node the graph already computed being read a second time.
+   */
+  anchorName: string | null
 }
 
 export interface FillLayerState extends LayerBase {

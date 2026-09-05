@@ -7,6 +7,7 @@ import type { Channel } from '../channels'
 import { CHANNELS } from '../channels'
 import { uid } from '../ids'
 import type {
+  AnchorRef,
   BlendMode,
   FillLayerState,
   FolderLayerState,
@@ -74,6 +75,7 @@ export function createFillLayer(material: MaterialInstance, name = 'Fill'): Fill
     opacity: 1,
     channels: {},
     mask: null,
+    anchorName: null,
     material,
     projection: { ...DEFAULT_PROJECTION, scale: [...DEFAULT_PROJECTION.scale], offset: [...DEFAULT_PROJECTION.offset] },
   }
@@ -88,6 +90,7 @@ export function createPaintLayer(name = 'Paint'): PaintLayerState {
     opacity: 1,
     channels: {},
     mask: null,
+    anchorName: null,
     paintBufferId: uid('paint'),
   }
 }
@@ -101,6 +104,7 @@ export function createFolder(name = 'Folder', children: LayerState[] = []): Fold
     opacity: 1,
     channels: {},
     mask: null,
+    anchorName: null,
     collapsed: false,
     children,
   }
@@ -119,7 +123,11 @@ export function createMask(base = 0): MaskState {
   }
 }
 
-export function createGenerator(type: GeneratorType, params: Record<string, number | boolean | [number, number, number]> = {}): GeneratorState {
+export function createGenerator(
+  type: GeneratorType,
+  params: Record<string, number | boolean | [number, number, number]> = {},
+  anchorRef: AnchorRef | null = null,
+): GeneratorState {
   return {
     id: uid('gen'),
     type,
@@ -130,6 +138,7 @@ export function createGenerator(type: GeneratorType, params: Record<string, numb
     params,
     levels: { ...DEFAULT_LEVELS },
     invert: false,
+    anchorRef,
   }
 }
 
@@ -226,7 +235,14 @@ export function duplicateLayer(layer: LayerState): LayerState {
 }
 
 function reissueIds(layer: LayerState): void {
+  const previousId = layer.id
   layer.id = uid('layer')
+  // Two layers publishing the same anchor name is a coin toss for anyone
+  // reading the picker, and the copy is a different layer producing different
+  // pixels. The reference itself is kept: a duplicated generator that read
+  // somebody else's anchor should go on reading it.
+  if (layer.anchorName) layer.anchorName = `${layer.anchorName} copy`
+  remapAnchorRefs(layer, previousId, layer.id)
   if (layer.mask) {
     for (const gen of layer.mask.generators) gen.id = uid('gen')
     // A duplicated paint buffer needs its own id; the engine copies the pixels.
@@ -234,6 +250,84 @@ function reissueIds(layer: LayerState): void {
   }
   if (layer.kind === 'paint') layer.paintBufferId = uid('paint')
   if (layer.kind === 'folder') for (const child of layer.children) reissueIds(child)
+}
+
+/**
+ * Rewrites anchor references inside a subtree that pointed at `from` to `to`.
+ *
+ * A duplicated *folder* is the case that needs it: its children may reference
+ * each other, and those references have to follow the copy rather than keep
+ * pointing into the original group.
+ */
+function remapAnchorRefs(layer: LayerState, from: string, to: string): void {
+  const visit = (node: LayerState) => {
+    if (node.mask) {
+      for (const gen of node.mask.generators) {
+        if (gen.anchorRef?.layerId === from) gen.anchorRef = { ...gen.anchorRef, layerId: to }
+      }
+    }
+    if (node.kind === 'folder') for (const child of node.children) visit(child)
+  }
+  visit(layer)
+}
+
+/**
+ * The stack flattened into the order the compositor evaluates it in.
+ *
+ * Not the same as `walkLayers`. A folder composites its children first and only
+ * then blends the group as a unit, so its children are evaluated *before* it -
+ * post-order for folders, and bottom-up within every array. Anchor visibility
+ * is exactly this order, so anything that answers "can this layer see that
+ * anchor" has to ask here rather than guess from the tree shape.
+ */
+export function evaluationOrder(layers: LayerState[]): LayerState[] {
+  const out: LayerState[] = []
+  for (const layer of layers) {
+    if (layer.kind === 'folder') out.push(...evaluationOrder(layer.children))
+    out.push(layer)
+  }
+  return out
+}
+
+/** Every anchor point published in a stack, in evaluation order. */
+export function collectAnchors(layers: LayerState[]): { layerId: string; name: string }[] {
+  return evaluationOrder(layers)
+    .filter((layer) => Boolean(layer.anchorName))
+    .map((layer) => ({ layerId: layer.id, name: layer.anchorName as string }))
+}
+
+/**
+ * The anchors `layerId` may reference: those published by layers the
+ * compositor has already evaluated by the time it reaches this one.
+ *
+ * An unknown layer gets the whole list, which is what a caller asking "what
+ * anchors exist at all" wants.
+ */
+export function anchorsVisibleTo(layers: LayerState[], layerId: string): { layerId: string; name: string }[] {
+  const out: { layerId: string; name: string }[] = []
+  for (const layer of evaluationOrder(layers)) {
+    if (layer.id === layerId) break
+    if (layer.anchorName) out.push({ layerId: layer.id, name: layer.anchorName })
+  }
+  return out
+}
+
+/**
+ * Fills in fields added after a project file was written.
+ *
+ * Anything the document gains has to survive loading a file that predates it,
+ * and the alternative - declaring the field optional - pushes the same check
+ * into every reader instead of doing it once, here.
+ */
+export function normaliseLayer(layer: LayerState): LayerState {
+  if (layer.anchorName === undefined) layer.anchorName = null
+  if (layer.mask) {
+    for (const gen of layer.mask.generators) {
+      if (gen.anchorRef === undefined) gen.anchorRef = null
+    }
+  }
+  if (layer.kind === 'folder') for (const child of layer.children) normaliseLayer(child)
+  return layer
 }
 
 export function getTextureSet(project: ProjectState, id: string | null): TextureSetState | null {

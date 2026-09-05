@@ -23,6 +23,7 @@ import { Viewport } from './ui/Viewport'
 import type { Tool } from './ui/Viewport'
 import { ChannelSettings, LayerList, LayerToolbar } from './ui/panels/LayerPanel'
 import { MaterialBrowser } from './ui/panels/MaterialBrowser'
+import { SmartMaterialBrowser } from './ui/panels/SmartMaterials'
 import { LayerIdentity, MaterialSection, ProjectionSection } from './ui/panels/PropertiesPanel'
 import { BrushMaterialSection, BrushSection } from './ui/panels/BrushPanel'
 import { BakeSection } from './ui/panels/BakePanel'
@@ -319,6 +320,10 @@ function Workspace() {
 
             <Section id="brush-material" title="Brush Material" icon="◇" defaultOpen={tool !== 'orbit'}>
               <BrushMaterialSection />
+            </Section>
+
+            <Section id="smart" title="Smart Materials" icon="✧" defaultOpen>
+              <SmartMaterialBrowser />
             </Section>
 
             <Section id="catalogue" title="Catalogue" icon="▦">

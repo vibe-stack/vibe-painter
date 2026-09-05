@@ -25,10 +25,22 @@ import {
 } from 'three/webgpu'
 import { CHANNEL_TARGET_OPTIONS } from './targets'
 import type { Texture } from 'three/webgpu'
-import { cross, float, length, texture, uniform, vec3 } from 'three/tsl'
+import { cross, float, length, round, texture, uniform, vec3 } from 'three/tsl'
 import type { MeshMapNodes } from '../procedural/material'
 import type { V2, V3 } from './nodes'
-export const GEOMETRY_MAP_NAMES = ['geomPosition', 'geomNormal', 'geomTangent'] as const
+export const GEOMETRY_MAP_NAMES = ['geomPosition', 'geomNormal', 'geomTangent', 'geomPositionFine'] as const
+
+/**
+ * How finely the position residual map subdivides one unit of normalised
+ * position. See `geomPositionFine` below.
+ *
+ * 256 is chosen so the residual reconstruction stays unambiguous: the coarse
+ * map's half-float error is at most 2^-11 of the bounding box, which is 0.125
+ * of a residual step - comfortably under the half step `round()` needs to
+ * recover the integer part, with room to spare for a mesh whose bounding box
+ * the bake normalises slightly outside 0..1.
+ */
+export const POSITION_SPLIT = 256
 
 /** @deprecated CPU baker payload; GPU bake writes a render target instead. */
 export interface RayMapData {
@@ -185,9 +197,11 @@ export class MeshMaps {
     const posSample = texture(this.geometry.textures[0], uvNode)
     const nrmSample = texture(this.geometry.textures[1], uvNode)
     const tanSample = texture(this.geometry.textures[2], uvNode)
+    const finePosition = texture(this.geometry.textures[3], uvNode).xyz
 
     const position = posSample.xyz
     const coverage = posSample.w
+    const island = texture(this.islandMask.texture, uvNode).x
 
     // Every normalise here is guarded, and that is not defensive padding - it
     // is the difference between a working app and one that turns black.
@@ -214,9 +228,31 @@ export class MeshMaps {
 
     const ray = this.#rayBaked ? texture(this.#ray.texture, uvNode) : null
 
+    // Position, recovered to roughly 2e-6 of the bounding box.
+    //
+    // The half-float coarse map quantises position to about 5e-4 of the model,
+    // which at 2K is a whole texel: neighbouring texels come back holding the
+    // *same* world position, so a brush that tests distance against it cannot
+    // resolve an edge finer than that. Everything painted looked sprayed on.
+    //
+    // The residual map carries the fractional part the coarse map threw away.
+    // `round()` recovers which residual period this texel belongs to - the
+    // coarse error is a fraction of a period, so the answer is exact - and the
+    // sum is the position the bake actually saw.
+    //
+    // Only inside a UV island: dilation floods the gutter by averaging
+    // neighbours, and averaging a value that wraps at every period is
+    // meaningless. Gutter texels are padding, where the coarse answer is
+    // several orders of magnitude better than it needs to be.
+    const scaled = position.mul(POSITION_SPLIT)
+    const period = round(scaled.sub(finePosition))
+    const refined = period.add(finePosition).div(POSITION_SPLIT)
+    const precise = island.greaterThan(float(0.5)).select(refined, position) as V3
+
     return {
       position,
       worldPosition: position.mul(this.#bboxSize).add(this.#bboxMin),
+      worldPositionPrecise: precise.mul(this.#bboxSize).add(this.#bboxMin),
       normal,
       tangent: orthoTangent,
       bitangent,
@@ -224,7 +260,7 @@ export class MeshMaps {
       curvature: ray ? ray.y : float(0.5),
       thickness: ray ? ray.z : float(0.5),
       coverage,
-      island: texture(this.islandMask.texture, uvNode).x,
+      island,
       partId: texture(this.idMap.texture, uvNode).x,
       baked: ray !== null,
     }
@@ -266,6 +302,7 @@ export function neutralMeshMaps(): MeshMapNodes {
   return {
     position: vec3(0.5, 0.5, 0.5),
     worldPosition: vec3(0, 0, 0),
+    worldPositionPrecise: vec3(0, 0, 0),
     normal: vec3(0, 0, 1),
     tangent: vec3(1, 0, 0),
     bitangent: vec3(0, 1, 0),

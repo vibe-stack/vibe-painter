@@ -11,8 +11,8 @@
 import { useState } from 'react'
 import { useApi, useEngineVersion } from '../context'
 import { listGeneratorDefs, getGeneratorDef } from '../../core/procedural/generators'
-import type { GeneratorType, Levels } from '../../core/doc/types'
-import { BLEND_MODES } from '../../core/doc/types'
+import type { AnchorSource, GeneratorType, Levels } from '../../core/doc/types'
+import { ANCHOR_SOURCES, BLEND_MODES } from '../../core/doc/types'
 import { Button, EmptyHint, IconButton, Select, Slider, Toggle } from '../widgets/controls'
 import { Card, Note, ParamGroupLabel } from '../widgets/sections'
 import { ParamEditor } from '../widgets/ParamEditor'
@@ -38,7 +38,19 @@ export function MaskSection() {
           <Button onClick={() => api.enableMaskPainting(layerId)}>Paintable</Button>
           <Button onClick={() => api.addMask(layerId, { base: 0, generator: 'curvature' })}>Edge Wear</Button>
           <Button onClick={() => api.addMask(layerId, { base: 0, generator: 'dirt' })}>Dirt</Button>
+          <Button onClick={() => api.addMask(layerId, { base: 0, generator: 'scratches' })}>Scratches</Button>
           <Button onClick={() => api.addMask(layerId, { base: 0, generator: 'idSelect' })}>Mesh ID</Button>
+          <Button
+            disabled={api.listAnchors(layerId).length === 0}
+            title={
+              api.listAnchors(layerId).length === 0
+                ? 'No anchor points below this layer yet. Turn one on from the Layer section of a layer underneath.'
+                : undefined
+            }
+            onClick={() => api.addMask(layerId, { base: 0, generator: 'anchor' })}
+          >
+            Anchor
+          </Button>
         </div>
       </>
     )
@@ -159,6 +171,14 @@ export function MaskSection() {
               onChange={(levels) => api.setGenerator(layerId, generator.id, { levels })}
             />
             {generator.type === 'idSelect' && <IdPartPicker layerId={layerId} generatorId={generator.id} value={Number(generator.params.partId ?? 0)} />}
+            {generator.type === 'anchor' && (
+              <AnchorPicker
+                layerId={layerId}
+                generatorId={generator.id}
+                anchorLayerId={generator.anchorRef?.layerId ?? null}
+                source={generator.anchorRef?.source ?? 'mask'}
+              />
+            )}
             <ParamEditor
               scope={`gen:${generator.id}`}
               params={def.params.filter((param) => !(generator.type === 'idSelect' && param.key === 'partId'))}
@@ -193,6 +213,81 @@ function IdPartPicker({
       options={parts.map((part) => ({ value: String(part.index), label: part.name }))}
       onChange={(next) => api.setGenerator(layerId, generatorId, { params: { partId: Number(next) } })}
     />
+  )
+}
+
+const ANCHOR_SOURCE_LABELS: Record<AnchorSource, string> = {
+  mask: 'Mask (where it applies)',
+  height: 'Height',
+  luminance: 'Base Colour Luminance',
+  opacity: 'Opacity',
+  roughness: 'Roughness',
+  ao: 'Ambient Occlusion',
+}
+
+/**
+ * Picks the anchor a generator reads, and which of its outputs.
+ *
+ * The list is deliberately only the anchors *below* this layer. The stack is
+ * one fused shader evaluated bottom-up, so an anchor above has not been
+ * computed when this mask is - offering it would be offering a value that is
+ * always zero, which is a worse answer than not offering it.
+ */
+function AnchorPicker({
+  layerId,
+  generatorId,
+  anchorLayerId,
+  source,
+}: {
+  layerId: string
+  generatorId: string
+  anchorLayerId: string | null
+  source: AnchorSource
+}) {
+  const api = useApi()
+  useEngineVersion()
+  const anchors = api.listAnchors(layerId)
+
+  if (anchors.length === 0) {
+    return (
+      <Note tone="warn">
+        No anchor points below this layer. Select a layer underneath, turn on “Anchor Point” in its Layer section,
+        and it will appear here.
+      </Note>
+    )
+  }
+
+  const known = anchors.some((anchor) => anchor.layerId === anchorLayerId)
+
+  return (
+    <>
+      <Select
+        label="Anchor"
+        hint="Which layer below this one to follow."
+        value={known ? (anchorLayerId as string) : ''}
+        options={[
+          ...(known ? [] : [{ value: '', label: 'Pick an anchor…' }]),
+          ...anchors.map((anchor) => ({ value: anchor.layerId, label: anchor.name })),
+        ]}
+        onChange={(next) => {
+          if (next) api.setGeneratorAnchor(layerId, generatorId, { layerId: next, source })
+        }}
+      />
+      <Select
+        label="Reads"
+        hint="Which of the anchored layer's outputs drives this mask."
+        value={source}
+        options={ANCHOR_SOURCES.map((value) => ({ value, label: ANCHOR_SOURCE_LABELS[value] }))}
+        onChange={(next) => {
+          if (anchorLayerId) api.setGeneratorAnchor(layerId, generatorId, { layerId: anchorLayerId, source: next })
+        }}
+      />
+      {!known && anchorLayerId && (
+        <Note tone="warn">
+          This generator points at a layer that is no longer below it, so it contributes nothing. Pick another anchor.
+        </Note>
+      )}
+    </>
   )
 }
 

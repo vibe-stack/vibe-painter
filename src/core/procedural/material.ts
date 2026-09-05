@@ -26,6 +26,15 @@ export interface MeshMapNodes {
   position: V3
   /** World-space position, in mesh units. */
   worldPosition: V3
+  /**
+   * The same position, reconstructed from the residual map.
+   *
+   * Only correct when read at a texel centre - a 1:1 fullscreen pass over the
+   * texture set - and only inside a UV island. That covers exactly the one
+   * caller that needs it: the brush, whose whole job is to compare a world
+   * distance against a radius that may be a few texels wide.
+   */
+  worldPositionPrecise: V3
   /** World-space shading normal. */
   normal: V3
   /** World-space tangent (from the mesh UV parameterisation). */

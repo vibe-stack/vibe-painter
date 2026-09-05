@@ -13,6 +13,7 @@
  */
 
 import { uid } from '../ids'
+import { normaliseLayer } from './document'
 import type { LayerState, ProjectState, TextureSetState } from './types'
 
 export const FILE_VERSION = 1
@@ -63,6 +64,9 @@ export function deserializeProject(input: unknown): ProjectFile {
   for (const mesh of file.project.meshes ?? []) {
     if (!mesh.parts) mesh.parts = []
   }
+  for (const set of file.project.textureSets ?? []) {
+    for (const layer of set.layers ?? []) normaliseLayer(layer)
+  }
   return {
     format: 'vibe-painter-project',
     version: file.version,
@@ -100,7 +104,7 @@ export function deserializeSmartMaterial(input: unknown): SmartMaterialFile {
     version: file.version ?? FILE_VERSION,
     name: file.name ?? 'Smart Material',
     description: file.description ?? '',
-    layer: file.layer,
+    layer: normaliseLayer(file.layer),
   }
 }
 
@@ -111,11 +115,35 @@ export function instantiateSmartMaterial(file: SmartMaterialFile): LayerState {
   return layer
 }
 
+/**
+ * Fresh ids, with anchor references rewritten to match.
+ *
+ * A smart material is very often a *group* whose upper layers read an anchor
+ * published by a lower one - "grime, wherever the paint chipped". Reissuing ids
+ * without remapping those references would leave the applied copy pointing at
+ * layer ids that no longer exist, and the effect would silently come out empty.
+ */
 function reissue(layer: LayerState): void {
-  layer.id = uid('layer')
-  if (layer.mask) for (const gen of layer.mask.generators) gen.id = uid('gen')
-  if (layer.kind === 'paint') layer.paintBufferId = uid('paint')
-  if (layer.kind === 'folder') for (const child of layer.children) reissue(child)
+  const remap = new Map<string, string>()
+  const assign = (node: LayerState) => {
+    const next = uid('layer')
+    remap.set(node.id, next)
+    node.id = next
+    if (node.mask) for (const gen of node.mask.generators) gen.id = uid('gen')
+    if (node.kind === 'paint') node.paintBufferId = uid('paint')
+    if (node.kind === 'folder') for (const child of node.children) assign(child)
+  }
+  const relink = (node: LayerState) => {
+    if (node.mask) {
+      for (const gen of node.mask.generators) {
+        const target = gen.anchorRef ? remap.get(gen.anchorRef.layerId) : undefined
+        if (gen.anchorRef && target) gen.anchorRef = { ...gen.anchorRef, layerId: target }
+      }
+    }
+    if (node.kind === 'folder') for (const child of node.children) relink(child)
+  }
+  assign(layer)
+  relink(layer)
 }
 
 function stripPaint(layer: LayerState): LayerState {
