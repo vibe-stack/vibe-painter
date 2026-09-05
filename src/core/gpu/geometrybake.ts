@@ -106,12 +106,12 @@ export class GeometryBaker {
       Math.max(1e-5, max.z - min.z),
     )
 
-    // Rasterise a 2-texel larger triangle in UV than the mesh actually samples.
-    // Vertex UVs sit on island borders; bilinear then reads the texel *outside*
-    // the triangle. Expanding the bake — not the mesh, not a flood of the
-    // composite — is what covers that neighbourhood without smearing islands
-    // into each other.
-    const expanded = expandTriangleUVs(geometry, maps.resolution, 2)
+    // Rasterise each triangle larger in UV than the mesh samples. Vertex UVs
+    // sit on island borders; bilinear then reads the texel *outside* the
+    // triangle — including along sharp 3D edges, which unique-unwrap cuts into
+    // separate charts. Expanding the bake (not the mesh, not a flood of the
+    // composite) covers that neighbourhood without smearing islands together.
+    const expanded = expandTriangleUVs(geometry, maps.resolution, 4)
     this.#pass.render(renderer, expanded, this.#buildMaterial(), maps.geometry, true)
     // Snapshot which texels are real surface *before* dilation floods the
     // coverage channel outward. Paint padding needs this unflooded answer.
@@ -170,35 +170,58 @@ export class GeometryBaker {
 }
 
 /**
- * Pushes each triangle's vertices away from its UV centroid so the rasteriser
- * covers the texel centres that sit on the island border. The painted mesh's
- * own UVs are not touched; this clone exists only for the ID pass.
+ * Offsets each UV edge along its outward 2D normal so the rasteriser covers
+ * the bilinear neighbourhood of every mesh vertex.
+ *
+ * Pushing vertices away from the centroid is not enough: unique-unwrap charts
+ * are often skinny, and that move is almost parallel to the long edge, so the
+ * edge that actually sits on an island border barely grows. An edge-normal
+ * offset grows every side by a known texel amount. The painted mesh's UVs are
+ * not touched — this clone exists only for the bake.
  */
 function expandTriangleUVs(geometry: BufferGeometry, resolution: number, texels: number): BufferGeometry {
   const source = geometry.getIndex() ? geometry.toNonIndexed() : geometry.clone()
   const uv = source.getAttribute('uv')
   if (!uv || uv.count < 3) return source
   const pad = texels / Math.max(1, resolution)
+  const maxMiter = pad * 8
   const out = new Float32Array(uv.count * 2)
+
+  const outward = (ax: number, ay: number, bx: number, by: number, sign: number): [number, number] => {
+    const dx = bx - ax
+    const dy = by - ay
+    const len = Math.hypot(dx, dy)
+    if (len < 1e-12) return [0, 0]
+    return [(dy / len) * sign, (-dx / len) * sign]
+  }
+
   for (let i = 0; i + 2 < uv.count; i += 3) {
     const u0 = uv.getX(i), v0 = uv.getY(i)
     const u1 = uv.getX(i + 1), v1 = uv.getY(i + 1)
     const u2 = uv.getX(i + 2), v2 = uv.getY(i + 2)
-    const cu = (u0 + u1 + u2) / 3
-    const cv = (v0 + v1 + v2) / 3
-    const pts: [number, number][] = [[u0, v0], [u1, v1], [u2, v2]]
+    const area = (u1 - u0) * (v2 - v0) - (u2 - u0) * (v1 - v0)
+    const sign = area >= 0 ? 1 : -1
+    const n01 = outward(u0, v0, u1, v1, sign)
+    const n12 = outward(u1, v1, u2, v2, sign)
+    const n20 = outward(u2, v2, u0, v0, sign)
+    const verts: [number, number, [number, number], [number, number]][] = [
+      [u0, v0, n20, n01],
+      [u1, v1, n01, n12],
+      [u2, v2, n12, n20],
+    ]
     for (let k = 0; k < 3; k++) {
-      const du = pts[k][0] - cu
-      const dv = pts[k][1] - cv
-      const len = Math.hypot(du, dv)
-      const o = (i + k) * 2
-      if (len < 1e-12) {
-        out[o] = pts[k][0]
-        out[o + 1] = pts[k][1]
-        continue
+      const [u, v, a, b] = verts[k]
+      let ox = (a[0] + b[0]) * pad
+      let oy = (a[1] + b[1]) * pad
+      const miter = Math.hypot(ox, oy)
+      if (miter > maxMiter && miter > 1e-12) {
+        const s = maxMiter / miter
+        ox *= s
+        oy *= s
       }
-      out[o] = pts[k][0] + (du / len) * pad
-      out[o + 1] = pts[k][1] + (dv / len) * pad
+      const o = (i + k) * 2
+      out[o] = u + ox
+      out[o + 1] = v + oy
     }
   }
   source.setAttribute('uv', new BufferAttribute(out, 2))
