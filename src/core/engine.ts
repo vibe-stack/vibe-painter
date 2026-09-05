@@ -266,6 +266,13 @@ export class Engine {
     return findLayer(set.layers, this.project.activeLayerId)?.layer ?? null
   }
 
+  /** Selection only — no compositor rebuild. */
+  setActiveLayer(id: string | null): void {
+    this.project.activeLayerId = id
+    this.events.emit('documentChanged', { reason: 'selectLayer' })
+    this.#notify('selectLayer')
+  }
+
   /** Call after any document mutation. Cheap; safe to over-call. */
   sync(reason = 'document'): void {
     const set = this.activeTextureSet

@@ -6,6 +6,7 @@
  * edited at different moments and it is worth being able to close one.
  */
 
+import { useState } from 'react'
 import { useApi, useEngineVersion } from '../context'
 import { getMaterialDef } from '../../core/procedural/material'
 import { PROJECTIONS } from '../../core/doc/types'
@@ -143,24 +144,10 @@ export function ProjectionSection() {
         </div>
       </Row>
 
-      <Row label="Tiling">
-        <div className="grid grid-cols-2 gap-1.5">
-          <NumberField
-            value={projection.scale[0]}
-            min={0.05}
-            max={40}
-            step={0.01}
-            onChange={(value) => api.setProjection(layerId, { scale: [value, projection.scale[1]] })}
-          />
-          <NumberField
-            value={projection.scale[1]}
-            min={0.05}
-            max={40}
-            step={0.01}
-            onChange={(value) => api.setProjection(layerId, { scale: [projection.scale[0], value] })}
-          />
-        </div>
-      </Row>
+      <TilingControls
+        scale={projection.scale}
+        onChange={(scale) => api.setProjection(layerId, { scale })}
+      />
 
       <Row label="Offset">
         <div className="grid grid-cols-2 gap-1.5">
@@ -212,6 +199,79 @@ export function ProjectionSection() {
             { value: 'z' as const, label: 'Z' },
           ]}
           onChange={(axis) => api.setProjection(layerId, { axis })}
+        />
+      )}
+    </>
+  )
+}
+
+const TILING_MIN = 0.2
+const TILING_MAX = 64
+
+function TilingControls({
+  scale,
+  onChange,
+}: {
+  scale: [number, number]
+  onChange: (scale: [number, number]) => void
+}) {
+  const [separate, setSeparate] = useState(false)
+  const split = separate || Math.abs(scale[0] - scale[1]) > 1e-3
+
+  return (
+    <>
+      <div className="flex items-center justify-end px-2">
+        <button
+          type="button"
+          title={split ? 'Lock X and Y together' : 'Edit X and Y separately'}
+          onClick={() => {
+            if (split) {
+              const mean = (scale[0] + scale[1]) / 2
+              onChange([mean, mean])
+              setSeparate(false)
+            } else {
+              setSeparate(true)
+            }
+          }}
+          className={`rounded-[3px] px-1.5 py-[1px] text-[9px] tabular-nums transition-colors ${
+            split ? 'text-app-faint hover:text-app-muted' : 'bg-app-raised text-app-muted'
+          }`}
+        >
+          {split ? 'X ≠ Y' : 'X = Y'}
+        </button>
+      </div>
+      {split ? (
+        <>
+          <Slider
+            label="Tiling X"
+            hint="Higher tiling makes the pattern finer. This is the control that sharpens a blurry catalogue material."
+            value={scale[0]}
+            min={TILING_MIN}
+            max={TILING_MAX}
+            step={0.01}
+            curve="log"
+            onChange={(value) => onChange([value, scale[1]])}
+          />
+          <Slider
+            label="Tiling Y"
+            value={scale[1]}
+            min={TILING_MIN}
+            max={TILING_MAX}
+            step={0.01}
+            curve="log"
+            onChange={(value) => onChange([scale[0], value])}
+          />
+        </>
+      ) : (
+        <Slider
+          label="Tiling"
+          hint="How many times the material repeats across the model. Higher = finer, sharper detail. Lower = larger features."
+          value={scale[0]}
+          min={TILING_MIN}
+          max={TILING_MAX}
+          step={0.01}
+          curve="log"
+          onChange={(value) => onChange([value, value])}
         />
       )}
     </>

@@ -278,7 +278,12 @@ export const DEFAULT_CHANNEL_SETTINGS: ChannelSettings = { enabled: true, opacit
  */
 export const DEFAULT_PROJECTION: ProjectionSettings = {
   mode: 'triplanar',
-  scale: [1.6, 1.6],
+  /**
+   * Repeats across the fitted mesh (~2 units). 1.6 was 1:1 on the cube and
+   * reads as a single blurry blob on an imported car; 8 is fine metal grain
+   * / brick scale. The projection slider goes well beyond this.
+   */
+  scale: [8, 8],
   offset: [0, 0],
   rotation: 0,
   blendSharpness: 4,

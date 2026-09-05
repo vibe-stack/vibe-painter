@@ -72,10 +72,11 @@ function LayerRow({ layer, active }: { layer: LayerSummary; active: boolean }) {
   return (
     <li>
       <div
-        className={`group flex items-center gap-1.5 py-[3px] pr-1 text-[11px] transition-colors ${
+        className={`group flex cursor-pointer items-center gap-1.5 py-[3px] pr-1 text-[11px] transition-colors ${
           active ? 'bg-app-accent-dim/45 text-app-text' : 'text-app-muted hover:bg-app-raised'
         }`}
         style={{ paddingLeft: 4 + layer.depth * 12 }}
+        onClick={() => api.selectLayer(layer.id)}
       >
         <button
           type="button"
@@ -83,7 +84,10 @@ function LayerRow({ layer, active }: { layer: LayerSummary; active: boolean }) {
           className={`w-3.5 shrink-0 text-center text-[9px] transition-colors ${
             layer.visible ? 'text-app-muted hover:text-app-text' : 'text-app-faint hover:text-app-dim'
           }`}
-          onClick={() => api.setLayerProps(layer.id, { visible: !layer.visible })}
+          onClick={(event) => {
+            event.stopPropagation()
+            api.setLayerProps(layer.id, { visible: !layer.visible })
+          }}
         >
           {layer.visible ? '●' : '○'}
         </button>
@@ -100,13 +104,13 @@ function LayerRow({ layer, active }: { layer: LayerSummary; active: boolean }) {
           }}
         />
 
-        <button type="button" className="min-w-0 flex-1 text-left" onClick={() => api.selectLayer(layer.id)}>
+        <div className="min-w-0 flex-1 text-left">
           <span className={`block truncate ${active ? 'text-app-text' : ''}`}>{layer.name}</span>
           <span className="block truncate text-[9px] text-app-faint">
             {def?.name ?? (layer.kind === 'paint' ? 'Painted pixels' : layer.kind === 'folder' ? 'Group' : '—')}
             {layer.hasMask ? ` · mask${layer.generatorCount ? ` (${layer.generatorCount})` : ''}` : ''}
           </span>
-        </button>
+        </div>
 
         {/* An anchored layer is one other layers depend on, which is worth
             seeing from the stack rather than only from the inspector. */}
@@ -119,7 +123,10 @@ function LayerRow({ layer, active }: { layer: LayerSummary; active: boolean }) {
           </span>
         )}
 
-        <div className="hidden shrink-0 items-center gap-0.5 group-hover:flex">
+        <div
+          className="hidden shrink-0 items-center gap-0.5 group-hover:flex"
+          onClick={(event) => event.stopPropagation()}
+        >
           <IconButton title="Move up" onClick={() => shift(api, layer, 1)}>
             ↑
           </IconButton>

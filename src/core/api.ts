@@ -386,8 +386,7 @@ export class VibePainter {
   }
 
   selectLayer(id: string | null): void {
-    this.engine.project.activeLayerId = id
-    this.engine.events.emit('documentChanged', { reason: 'selectLayer' })
+    this.engine.setActiveLayer(id)
   }
 
   get activeLayerId(): string | null {
